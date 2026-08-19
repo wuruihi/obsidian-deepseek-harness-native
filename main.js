@@ -27,6 +27,7 @@ const {
     MarkdownRenderer,
     Component,
     Modal,
+    MarkdownView,
     requestUrl,
 } = require("obsidian");
 const net = require("net");
@@ -39,6 +40,8 @@ const crypto = require("crypto");
 
 const VIEW_TYPE = "dsh-native-view";
 
+const DEFAULT_DSH_REPO_URL = "https://github.com/deepseek-ai/deepseek-harness.git";
+
 const DEFAULT_SETTINGS = {
     port: 3080,
     startupCommand:
@@ -50,12 +53,14 @@ const DEFAULT_SETTINGS = {
     readyTimeoutMs: 120000,
     mode: "queue", // session.prompt 的 mode: "queue" | "steer"
     installDir: "", // 一键安装目标目录（默认 ~\\deepseek-harness）
+    installUrl: DEFAULT_DSH_REPO_URL, // 克隆地址（国内可换 gh-proxy 镜像）
+    selectionButton: false, // 框选后显示「发送到 DSH」浮动按钮
+    openPanelOnSend: false, // 发送后自动打开/聚焦 DSH 面板
 };
 
 /* ====================================================================
  * DSH 安装检测 + 一键安装（从 dsh-harness 旧插件移植，简化版）
  * ================================================================== */
-const DEFAULT_DSH_REPO_URL = "https://github.com/deepseek-ai/deepseek-harness.git";
 const INSTALL_TIMEOUT_MS = 600000; // git clone / pnpm install 单步上限
 
 function isDshRepo(dir) {
@@ -146,7 +151,7 @@ function spawnStep(cmd, args, opts, onStep) {
         });
     });
 }
-async function installDsh(targetDir, onStep) {
+async function installDsh(targetDir, onStep, repoUrl) {
     const fs = require("fs");
     const path = require("path");
     if (!targetDir) return { ok: false, message: "目标目录为空" };
@@ -168,7 +173,7 @@ async function installDsh(targetDir, onStep) {
         "--config", "http.postBuffer=524288000",
         "--config", "http.lowSpeedLimit=1000",
         "--config", "http.lowSpeedTime=30",
-        DEFAULT_DSH_REPO_URL, targetDir,
+        repoUrl || DEFAULT_DSH_REPO_URL, targetDir,
     ], { timeout: INSTALL_TIMEOUT_MS });
     if (!r1.ok) return { ok: false, message: "git clone 失败：" + (r1.err || r1.out).slice(0, 300) };
     if (!fs.existsSync(targetDir) || !isDshRepo(targetDir)) {
@@ -1978,7 +1983,7 @@ class DshNativeSettingTab extends PluginSettingTab {
                         const tail = text.trim().split("\n").slice(-1)[0].slice(0, 80);
                         if (tail) this._dshStatusEl.setText("… " + tail);
                     }
-                });
+                }, this.plugin.settings.installUrl);
                 this._dshStatusEl.setText(result.message);
                 if (result.ok) {
                     new Notice("DSH 安装完成 ✓", 5000);
@@ -2024,6 +2029,72 @@ class DshNativeSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     })
             );
+
+        // ===== 快捷操作 =====
+        new Setting(containerEl).setName("在浏览器打开 DSH").setDesc("用系统默认浏览器打开 DSH Web GUI（独立窗口，不受侧栏面板限制）。").addButton((b) =>
+            b.setButtonText("打开").onClick(() => this.plugin.openDshInBrowser())
+        );
+        new Setting(containerEl).setName("重启 DSH 服务").setDesc("结束占用端口的进程并重新启动；用于加载配置改动或面板卡住。").addButton((b) =>
+            b.setButtonText("重启").onClick(async () => {
+                b.setDisabled(true);
+                await this.plugin.restartService();
+                b.setDisabled(false);
+            })
+        );
+        new Setting(containerEl).setName("一键检测并填入").setDesc("已安装 DSH 时，自动检测位置并填好启动命令 / 工作目录 / 安装目录。").addButton((b) =>
+            b.setButtonText("检测并填入").onClick(async () => {
+                b.setDisabled(true);
+                const r = detectDsh();
+                if (r.found) {
+                    this.plugin.settings.startupCommand = r.startupCommand;
+                    if (r.startupCwd) this.plugin.settings.vaultPath = r.startupCwd;
+                    if (r.dir) this.plugin.settings.installDir = r.dir;
+                    await this.plugin.saveSettings();
+                    new Notice("已自动填入：" + r.message);
+                    this.display();
+                } else {
+                    new Notice(r.message);
+                }
+                b.setDisabled(false);
+            })
+        );
+
+        // ===== 收发 =====
+        new Setting(containerEl).setName("框选发送按钮").setDesc("在编辑器框选文字后，选区旁显示「发送到 DSH」浮动按钮（命令面板与右键菜单始终可用）。").addToggle((t) =>
+            t.setValue(this.plugin.settings.selectionButton).onChange(async (v) => {
+                this.plugin.settings.selectionButton = v;
+                await this.plugin.saveSettings();
+                if (!v) this.plugin.hideSelectionButton();
+            })
+        );
+        new Setting(containerEl).setName("发送后自动打开面板").setDesc("从笔记发送文字到 DSH 后，自动打开/聚焦 DSH 面板查看回复。").addToggle((t) =>
+            t.setValue(this.plugin.settings.openPanelOnSend).onChange(async (v) => {
+                this.plugin.settings.openPanelOnSend = v;
+                await this.plugin.saveSettings();
+            })
+        );
+
+        // ===== 高级 =====
+        new Setting(containerEl).setName("启动等待时间").setDesc("自动启动后等待服务就绪的最长时间（当前 " + Math.round(this.plugin.settings.readyTimeoutMs / 1000) + " 秒）；首次启动可能需 1–2 分钟。").addSlider((s) =>
+            s.setLimits(60, 600, 30).setValue(Math.round(this.plugin.settings.readyTimeoutMs / 1000)).onChange(async (v) => {
+                this.plugin.settings.readyTimeoutMs = v * 1000;
+                await this.plugin.saveSettings();
+                this.plugin.serviceManager.opts = this.plugin.getServiceOpts();
+            })
+        );
+        new Setting(containerEl).setName("进程独立常驻").setDesc("开启后，插件启动的 DSH 进程在 Obsidian 退出后继续运行（默认关：随 Obsidian 退出而终止）。").addToggle((t) =>
+            t.setValue(this.plugin.settings.detached).onChange(async (v) => {
+                this.plugin.settings.detached = v;
+                await this.plugin.saveSettings();
+                this.plugin.serviceManager.opts = this.plugin.getServiceOpts();
+            })
+        );
+        new Setting(containerEl).setName("安装地址").setDesc("克隆 DSH 的仓库地址；国内网络受限时可换代理镜像（如 https://gh-proxy.com/https://github.com/deepseek-ai/deepseek-harness.git）。").addText((t) =>
+            t.setPlaceholder(DEFAULT_DSH_REPO_URL).setValue(this.plugin.settings.installUrl).onChange(async (v) => {
+                this.plugin.settings.installUrl = v.trim() || DEFAULT_DSH_REPO_URL;
+                await this.plugin.saveSettings();
+            })
+        );
     }
     _dshStatus(r, defaultInstallDir) {
         if (!this._dshStatusEl) return;
@@ -2056,7 +2127,7 @@ class DshNativePlugin extends Plugin {
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
-                require("path").join(this.app.vault.adapter.basePath, ".obsidian", "plugins", "obsidian-dsh-native", "last_loaded.txt"),
+                require("path").join(this.app.vault.adapter.basePath, ".obsidian", "plugins", this.manifest.id, "last_loaded.txt"),
                 BUILD_TAG + "\n",
                 "utf8"
             );
@@ -2094,6 +2165,12 @@ class DshNativePlugin extends Plugin {
         });
 
         this.addSettingTab(new DshNativeSettingTab(this.app, this));
+
+        // 框选浮动发送按钮：Obsidian 无选区工作区事件，由文档级 mouseup/keyup/selectionchange 驱动
+        const onSel = () => this.onSelectionEvent(true);
+        this.registerDomEvent(document, "mouseup", onSel);
+        this.registerDomEvent(document, "keyup", onSel);
+        this.registerDomEvent(document, "selectionchange", () => this.onSelectionEvent(false));
     }
 
     onunload() {
@@ -2355,6 +2432,92 @@ class DshNativePlugin extends Plugin {
         if (view && view.boot) await view.boot();
     }
 
+    /* ===== 在浏览器打开 DSH Web GUI ===== */
+    openInBrowser(url) {
+        try {
+            const electron = require("electron");
+            if (electron && electron.shell) {
+                electron.shell.openExternal(url);
+                return;
+            }
+        } catch (e) {
+            /* electron 不可用时降级 */
+        }
+        try {
+            if (typeof window !== "undefined" && window.open) window.open(url, "_blank");
+        } catch (e2) {
+            /* ignore */
+        }
+    }
+    openDshInBrowser() {
+        this.openInBrowser(`http://127.0.0.1:${this.settings.port}/`);
+    }
+
+    /* ===== 框选文字浮动「发送到 DSH」按钮 ===== */
+    onSelectionEvent(reposition) {
+        if (!this.settings.selectionButton) {
+            this.hideSelectionButton();
+            return;
+        }
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        const editor = view ? view.editor : null;
+        const text = editor && editor.getSelection ? editor.getSelection().trim() : "";
+        if (!text) {
+            this.hideSelectionButton();
+            return;
+        }
+        const changed = text !== this._lastSelText;
+        this._lastSelText = text;
+        this._pendingSelText = text;
+        if (!this._selBtn) {
+            const btn = document.createElement("button");
+            btn.className = "dsh-native-send-btn";
+            btn.textContent = "发送到 DSH";
+            btn.addEventListener("click", () => {
+                const send = this._pendingSelText;
+                this.hideSelectionButton();
+                this.sendCurrentNote();
+            });
+            btn.style.cssText =
+                "position:fixed;z-index:9999;padding:2px 8px;font-size:12px;cursor:pointer;" +
+                "background:var(--interactive-accent);color:var(--text-on-accent);border:none;" +
+                "border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.3);";
+            document.body.appendChild(btn);
+            this._selBtn = btn;
+        }
+        if (changed || reposition) this._positionSelBtn(editor);
+    }
+    _positionSelBtn(editor) {
+        if (!this._selBtn) return;
+        try {
+            const el = editor.containerEl;
+            if (!el) return;
+            const rect = el.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            let left = rect.right - 8;
+            let top = rect.top + 8;
+            if (editor.coordsAtPos) {
+                const c = editor.coordsAtPos(editor.getCursor("from"));
+                if (c) {
+                    left = rect.left + c.left;
+                    top = rect.top + c.top - 8;
+                }
+            }
+            this._selBtn.style.left = Math.round(left) + "px";
+            this._selBtn.style.top = Math.round(top) + "px";
+        } catch (e) {
+            /* ignore */
+        }
+    }
+    hideSelectionButton() {
+        if (this._selBtn) {
+            this._selBtn.remove();
+            this._selBtn = null;
+        }
+        this._lastSelText = "";
+        this._pendingSelText = "";
+    }
+
     async sendCurrentNote() {
         const view = this.getView();
         if (!view || !view.sessionId) {
@@ -2377,6 +2540,7 @@ class DshNativePlugin extends Plugin {
         try {
             await this.api.prompt(view.sessionId, header + text.slice(0, 20000));
             new Notice("已发送到 DSH");
+            if (this.settings.openPanelOnSend) await this.activateView();
             if (!view.assistantEl) view.beginAssistantBubble();
         } catch (e) {
             new Notice("发送失败：" + e.message);
