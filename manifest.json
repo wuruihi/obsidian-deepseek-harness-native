@@ -1,0 +1,9 @@
+{
+    "id": "deepseek-harness-native",
+    "name": "DeepSeek Harness Native",
+    "version": "0.1.0",
+    "minAppVersion": "1.7.2",
+    "description": "在 Obsidian 侧边栏内驱动本地 DeepSeek Harness (DSH) Web GUI，支持 vault 双向桥接与 DSH 服务自动管理。",
+    "author": "wupang",
+    "isDesktopOnly": true
+}

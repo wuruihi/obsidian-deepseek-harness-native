@@ -1,0 +1,9 @@
+# Obsidian 运行时数据（不要进仓库）
+data.json
+last_loaded.txt
+
+# 依赖与系统文件
+node_modules/
+*.log
+.DS_Store
+.obsidian/
