@@ -1,7 +1,7 @@
 {
     "id": "deepseek-harness-native",
     "name": "DeepSeek Harness Native",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "minAppVersion": "1.7.2",
     "description": "在侧边栏内驱动本地 DeepSeek Harness (DSH) Web GUI，支持 vault 双向桥接与服务自动管理.",
     "author": "wupang",
