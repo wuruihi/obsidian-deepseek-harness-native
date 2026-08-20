@@ -179,16 +179,6 @@
     max-width: 220px;
 }
 .dsh-model-select:disabled { opacity: 0.55; cursor: not-allowed; }
-.dsh-model-current {
-    font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
-    padding: 0 6px;
-    border-left: 2px solid var(--background-modifier-border);
-    white-space: nowrap;
-    max-width: 200px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
 .dsh-perm-select {
     background: var(--background-primary);
     color: var(--text-normal);
