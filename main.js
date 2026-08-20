@@ -709,8 +709,20 @@ function extractPresetOptionsFromSchema(schema) {
 }
 /* ====================================================================
  * 助手文本预处理（修复 Bug 1: 隐藏系统上下文；修复 Bug 2: JSON 自动渲染为 dsh-ui）
+ * 参考 dsh-vscode/webview/src/fold.ts 的段落级 stripSystemContext（更稳健）
  * ================================================================== */
-// DSH 注入的运行时系统块，标记：开头 + 结束标签
+// 段落开头标记：DSH 注入的块（运行快照 / 策略通知 / 技能目录变更等）
+const INJECTED_HEADS = [
+    /^Current runtime context\b/,
+    /^Current DSH file policy:/,
+    /^The DSH file policy changed\b/,
+    /^Approval policy:/,
+    /^Approval prompts are disabled\b/,
+    /^The approval policy changed\b/,
+    /^This snapshot supersedes\b/,
+    /^The available skill catalog changed\b/,
+];
+
 function isSystemContextStart(s) {
     if (!s) return false;
     return /Current runtime context\b/.test(s)
@@ -719,31 +731,48 @@ function isSystemContextStart(s) {
         || /Current DSH file policy:/.test(s)
         || /Approval prompts are disabled/.test(s);
 }
-// 找到系统上下文块的结束位置；找不到返回 -1（保留原文本，不误删）
+
+function isInjectedParagraphStart(para) {
+    const first = (para.split("\n", 1)[0] || "").trim();
+    if (!first) return false;
+    if (INJECTED_HEADS.some((re) => re.test(first))) return true;
+    return isSystemContextStart(first);
+}
+
 function findSystemContextEnd(s) {
     if (!s) return -1;
     // 优先匹配 </available_skills> —— DSH 注入块的结尾
     let i = s.search(/<\/available_skills>/i);
     if (i >= 0) return i + "</available_skills>".length;
-    // 其次匹配 </system>
+    // 其次匹配 </system-reminder>（DSH 注入提醒块，结尾是区别于 </system> 的变体）
+    i = s.search(/<\/system-reminder>/i);
+    if (i >= 0) return i + "</system-reminder>".length;
+    // 泛化匹配 </system-xxx>（如 </system-message> 等）
+    const m = /<\/system-[a-z-]*>/i.exec(s);
+    if (m) return m.index + m[0].length;
+    // 最后匹配 </system>
     i = s.search(/<\/system>/i);
     if (i >= 0) return i + "</system>".length;
     return -1;
 }
-// 剥掉 DSH 注入的系统上下文块。返回剥后文本；若整段都是系统块则返回 ""。
+// 剥掉 DSH 注入的系统上下文。三段式：① 删除 <system-reminder> 包裹的 span（含流式未闭合）② 剥头部遗留 tag 块 ③ 删除段落级注入；无清晰边界则保留，绝不误删。
 function stripSystemContext(text) {
     if (!text) return text;
-    let s = text;
-    // 反复剥（可能多段）
+    // 1) 删除 <system-reminder>…</system-reminder>（含未闭合：截断到结尾）
+    let s = text
+        .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "")
+        .replace(/<system-reminder>[\s\S]*$/, "");
+    // 2) 头部遗留 tag 块（<system> / <available_skills>）；找不到边界则保留
     let guard = 0;
-    while (guard++ < 8) {
-        if (!isSystemContextStart(s)) break;
+    while (guard++ < 8 && isSystemContextStart(s)) {
         const end = findSystemContextEnd(s);
-        if (end < 0) break; // 没有清晰边界，宁可保留
-        // 剥掉后顺便吃掉开头的空白行
+        if (end < 0) break;
         s = s.slice(end).replace(/^\s*\n+/, "");
     }
-    return s;
+    // 3) 段落级注入（运行快照 / 策略通知）：独立段落或追加在用户文本后，按段落头剔除
+    const paras = s.split(/\n\s*\n/);
+    const kept = paras.filter((p) => !isInjectedParagraphStart(p.trim()));
+    return kept.join("\n\n").trim();
 }
 // 把单行/多行裸 dsh-ui JSON 自动包进 ```dsh-ui``` 代码块，postProcessDshUi 就能识别
 // 启发式：根对象有 "items" 数组 且 顶层有 "type" 或 "title" 字段（命中 dsh-ui spec 形态）
