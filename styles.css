@@ -343,6 +343,55 @@
     padding: 2px;
 }
 .dsh-msg-assistant:hover .dsh-msg-actions { display: flex; }
+
+/* 修复 Bug 3：用户消息可见性强制 */
+.dsh-msg-user {
+    display: flex !important;
+    flex-direction: column;
+    align-items: flex-end; /* 用户消息靠右 */
+}
+.dsh-msg-user .dsh-msg-content {
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    max-width: 88%;
+    align-self: flex-end;
+}
+.dsh-msg-user .dsh-msg-content:empty:not(.dsh-msg-fallback) {
+    /* 空内容兜底，避免气泡塌成 0 高度看不见 */
+    min-height: 1.5em;
+}
+
+/* 修复 Bug 4：工具 / 子代理 / 步骤活动行（按顺序挂在助手气泡下方） */
+.dsh-activities {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--background-modifier-border);
+}
+.dsh-activity {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: var(--radius-s);
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+.dsh-activity.is-active { border-color: var(--interactive-accent); color: var(--text-normal); }
+.dsh-activity.is-done { opacity: 0.75; }
+.dsh-activity-icon { flex: 0 0 auto; }
+.dsh-activity-text { font-weight: 600; }
+.dsh-activity-detail {
+    color: var(--text-faint);
+    font-family: var(--font-monospace, monospace);
+    overflow-wrap: anywhere;
+}
 .dsh-mini-btn {
     cursor: pointer;
     border: 1px solid var(--background-modifier-border);

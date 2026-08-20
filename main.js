@@ -708,6 +708,115 @@ function extractPresetOptionsFromSchema(schema) {
     } catch (_e) { return []; }
 }
 /* ====================================================================
+ * 助手文本预处理（修复 Bug 1: 隐藏系统上下文；修复 Bug 2: JSON 自动渲染为 dsh-ui）
+ * ================================================================== */
+// DSH 注入的运行时系统块，标记：开头 + 结束标签
+function isSystemContextStart(s) {
+    if (!s) return false;
+    return /Current runtime context\b/.test(s)
+        || /<system\b/.test(s)
+        || /<available_skills>/.test(s)
+        || /Current DSH file policy:/.test(s)
+        || /Approval prompts are disabled/.test(s);
+}
+// 找到系统上下文块的结束位置；找不到返回 -1（保留原文本，不误删）
+function findSystemContextEnd(s) {
+    if (!s) return -1;
+    // 优先匹配 </available_skills> —— DSH 注入块的结尾
+    let i = s.search(/<\/available_skills>/i);
+    if (i >= 0) return i + "</available_skills>".length;
+    // 其次匹配 </system>
+    i = s.search(/<\/system>/i);
+    if (i >= 0) return i + "</system>".length;
+    return -1;
+}
+// 剥掉 DSH 注入的系统上下文块。返回剥后文本；若整段都是系统块则返回 ""。
+function stripSystemContext(text) {
+    if (!text) return text;
+    let s = text;
+    // 反复剥（可能多段）
+    let guard = 0;
+    while (guard++ < 8) {
+        if (!isSystemContextStart(s)) break;
+        const end = findSystemContextEnd(s);
+        if (end < 0) break; // 没有清晰边界，宁可保留
+        // 剥掉后顺便吃掉开头的空白行
+        s = s.slice(end).replace(/^\s*\n+/, "");
+    }
+    return s;
+}
+// 把单行/多行裸 dsh-ui JSON 自动包进 ```dsh-ui``` 代码块，postProcessDshUi 就能识别
+// 启发式：根对象有 "items" 数组 且 顶层有 "type" 或 "title" 字段（命中 dsh-ui spec 形态）
+function wrapDshUiJson(text) {
+    if (!text || text.indexOf('"items"') < 0) return text;
+    // 找到所有可能的 JSON 起点：行首或非 ASCII 字符后的 {
+    // 用非贪婪匹配，匹配到配对 }（简化：取首个 "{...}" 顶层对象 —— 不嵌套内层）
+    let out = "";
+    let i = 0;
+    let n = text.length;
+    while (i < n) {
+        const ch = text[i];
+        // 只在"看起来是 JSON 起点"的位置尝试
+        const tryHere = ch === "{" && (i === 0 || /\s|^\s*$/.test(text[i - 1]) || text[i - 1] === "\n");
+        if (!tryHere) {
+            out += ch;
+            i++;
+            continue;
+        }
+        // 找到匹配的右括号（顶层平衡）
+        let depth = 0;
+        let inStr = false;
+        let esc = false;
+        let j = i;
+        while (j < n) {
+            const c = text[j];
+            if (esc) { esc = false; j++; continue; }
+            if (c === "\\") { esc = true; j++; continue; }
+            if (c === '"') { inStr = !inStr; j++; continue; }
+            if (inStr) { j++; continue; }
+            if (c === "{") { depth++; j++; continue; }
+            if (c === "}") { depth--; j++; if (depth === 0) break; }
+            j++;
+        }
+        if (depth !== 0 || j > n) {
+            // 没闭合，保留原文
+            out += ch;
+            i++;
+            continue;
+        }
+        const candidate = text.slice(i, j);
+        // 解析试一下
+        let spec = null;
+        try { spec = JSON.parse(candidate); } catch (_e) { spec = null; }
+        const isDshUi = spec
+            && typeof spec === "object"
+            && Array.isArray(spec.items)
+            && (typeof spec.type === "string" || typeof spec.title === "string");
+        if (isDshUi) {
+            // 已是 dsh-ui 代码块就不重复包
+            const before = out.slice(Math.max(0, out.length - 30));
+            if (/```dsh-ui\s*$/i.test(before)) {
+                out += candidate;
+            } else {
+                out += "```dsh-ui\n" + candidate + "\n```";
+            }
+            i = j;
+        } else {
+            out += ch;
+            i++;
+        }
+    }
+    return out;
+}
+// 入口：先剥系统块，再把 JSON 包进 dsh-ui 代码块
+function preprocessAssistantText(text) {
+    if (!text) return text;
+    let s = stripSystemContext(text);
+    s = wrapDshUiJson(s);
+    return s;
+}
+
+/* ====================================================================
  * 聊天视图（原生 Obsidian UI）
  * ================================================================== */
 class DshNativeView extends ItemView {
@@ -1259,6 +1368,9 @@ class DshNativeView extends ItemView {
         this.assistantMd = "";
         this.thinkingMd = "";
         this._contentSetByWs = false;
+        // 重置工具/子代理活动跟踪（Bug 4）
+        this._activities = new Map();
+        this._activityHolder = null;
     }
 
     setStatus(state) {
@@ -1304,10 +1416,22 @@ class DshNativeView extends ItemView {
         }
     }
 
-    addUserBubble(text) {
+    async addUserBubble(text) {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-user");
+        // 修复 Bug 3：强制可见，避免被父级 flex 容器异常折叠
+        bubble.style.display = "flex";
         const content = bubble.createDiv("dsh-msg-content");
-        MarkdownRenderer.render(this.app, text, content, "", this);
+        content.style.minHeight = "1.5em";
+        const stamp = "u-" + (++this._userSeq || (this._userSeq = 1));
+        bubble.dataset.stamp = stamp;
+        try {
+            await MarkdownRenderer.render(this.app, text, content, "", this);
+        } catch (_e) {
+            // 兜底：渲染失败时显示纯文本，保证不消失
+            const pre = content.createEl("pre", { cls: "dsh-msg-fallback" });
+            pre.textContent = text;
+        }
+        // 渲染完成后再滚到底，确保用户消息可见
         this.scrollToBottom();
     }
 
@@ -1356,6 +1480,67 @@ class DshNativeView extends ItemView {
         this.scheduleRender();
     }
 
+    // 修复 Bug 4：把工具调用 / 子代理 / 块开始结束等"非文本但用户该看到"的事件
+    // 渲染成可滚动看的活动行（不挤进 assistantMd，避免触发 system-context 剥离）。
+    // 同名/同 id 的事件做折叠：start 显示一行进行中；end 在该行末尾追加"完成"标记。
+    appendActivity(chunk) {
+        if (!this.assistantEl) this.beginAssistantBubble();
+        const t = String(chunk.type || "");
+        const data = (chunk && chunk.data) || {};
+        const id = String(
+            data.toolCallId || data.callId || data.id
+            || data.agentId || data.subagentId || data.sessionId
+            || (t + ":" + (data.name || data.toolName || "") + ":" + Math.random().toString(36).slice(2, 6))
+        );
+        if (!this._activities) this._activities = new Map();
+        // 活动行挂在 assistantContent 之外的兄弟节点，下次 renderAssistantNow 清空 assistantContent 时不会误删
+        if (!this._activityHolder) {
+            this._activityHolder = this.assistantEl.createDiv("dsh-activities");
+        }
+        const finished = t.endsWith("-end") || t === "block-end";
+        const label = (() => {
+            if (t.startsWith("tool-")) return "🔧 调用工具：" + (data.name || data.toolName || "工具");
+            if (t === "agent-start" || t === "agent-end") return "👥 Agent：" + (data.name || data.agentId || "");
+            if (t === "subagent-start" || t === "subagent-end") {
+                const task = data.task || data.description || "";
+                return "👥 子代理：" + (data.name || data.agentId || data.subagentId || "工作") + (task ? "（" + task.slice(0, 30) + "）" : "");
+            }
+            if (t === "step-start" || t === "step-end") return "📍 步骤：" + (data.title || data.name || data.step || "");
+            if (t === "block-start") return "▸ 块开始：" + (data.kind || data.type || "");
+            if (t === "block-end") return "▾ 块结束";
+            return "· " + t;
+        })();
+        let row = this._activities.get(id);
+        if (!row) {
+            row = {};
+            row.root = this._activityHolder.createDiv("dsh-activity is-active");
+            row.icon = row.root.createSpan("dsh-activity-icon"); row.icon.textContent = "⏳";
+            row.text = row.root.createSpan("dsh-activity-text"); row.text.textContent = label;
+            row.detail = row.root.createSpan("dsh-activity-detail");
+            this._activities.set(id, row);
+        }
+        if (finished && !row.finished) {
+            row.icon.textContent = "✅";
+            row.root.removeClass("is-active"); row.root.addClass("is-done");
+            row.finished = true;
+            try {
+                const preview = data.result
+                    ? String(typeof data.result === "string" ? data.result : JSON.stringify(data.result)).slice(0, 200)
+                    : (data.error ? ("出错：" + String(data.error).slice(0, 200)) : "");
+                if (preview) row.detail.textContent = " — " + preview;
+            } catch (_e) { /* 忽略序列化失败 */ }
+        } else if (!finished) {
+            if (data.args || data.input) {
+                const a = data.args || data.input;
+                try { row.detail.textContent = " — " + (typeof a === "string" ? a : JSON.stringify(a)).slice(0, 200); }
+                catch (_e) { row.detail.textContent = ""; }
+            } else if (data.progress) {
+                row.detail.textContent = " — " + String(data.progress).slice(0, 200);
+            }
+        }
+        this.scrollToBottom();
+    }
+
     scheduleRender() {
         if (this.renderPending) return;
         this.renderPending = true;
@@ -1378,8 +1563,13 @@ class DshNativeView extends ItemView {
             this.postProcessDshUi(tw);
         }
         const body = contentEl.createDiv("dsh-msg-md");
-        await MarkdownRenderer.render(this.app, text || "", body, "", this);
+        // 修复 Bug 1 + Bug 2：渲染前先剥系统上下文、把裸 JSON 包进 dsh-ui 代码块
+        const cleaned = preprocessAssistantText(text || "");
+        await MarkdownRenderer.render(this.app, cleaned, body, "", this);
         this.postProcessDshUi(body);
+        // 修复 Bug 1：若清洗后整段都是系统块（DSH 注入空 turn），隐藏内容元素，避免留空气泡
+        if (text && !cleaned.trim()) contentEl.style.display = "none";
+        else contentEl.style.display = "";
     }
     async renderAssistantNow() {
         if (!this.assistantContent) return;
@@ -1426,6 +1616,9 @@ class DshNativeView extends ItemView {
         this.thinkingMd = "";
         this._turnDone = true;
         this._stopPoll();
+        // 重置工具/子代理活动跟踪（Bug 4 —— 下一轮从空开始）
+        this._activities = new Map();
+        this._activityHolder = null;
     }
 
     _stopPoll() {
@@ -1675,22 +1868,31 @@ class DshNativeView extends ItemView {
                 const chunk = ev.data && ev.data.chunk;
                 if (!chunk) break;
                 this.diagChunkCount = (this.diagChunkCount || 0) + 1;
-                // 跳过纯元数据 chunk
-                if (
-                    chunk.type === "usage" ||
-                    chunk.type === "finish" ||
-                    chunk.type === "tool-call-delta" ||
-                    chunk.type === "block-start" ||
-                    chunk.type === "block-end"
-                ) {
+                // 跳过纯元数据 chunk（仅更新内部计数，不渲染）
+                if (chunk.type === "usage" || chunk.type === "finish") {
                     break;
                 }
                 // 真实文字 delta：text-delta (普通文字) / reasoning-delta (思考文字)
                 if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
                     if (typeof chunk.text !== "string" || chunk.text.length === 0) break;
-                    this._contentSetByWs = true; // 标记 WS 实时增量已到（轮询会因历史变化自动对齐，这里仅是语义标记）
+                    this._contentSetByWs = true;
                     this.appendAssistant(chunk.text, chunk.type === "reasoning-delta");
+                    break;
                 }
+                // 修复 Bug 4：工具 / 子代理 / 块开始结束等"非文本但用户该看到"的事件 → 渲染成活动卡片
+                if (chunk.type === "block-start" || chunk.type === "block-end"
+                    || chunk.type === "tool-call" || chunk.type === "tool-call-delta"
+                    || chunk.type === "tool-result" || chunk.type === "tool-call-result"
+                    || chunk.type === "step-start" || chunk.type === "step-end"
+                    || chunk.type === "agent-start" || chunk.type === "agent-end"
+                    || chunk.type === "subagent-start" || chunk.type === "subagent-end") {
+                    this.appendActivity(chunk);
+                    break;
+                }
+                // 其他未知 chunk：记入诊断，但不当文本渲染（避免把内部协议 JSON 泄漏到气泡里）
+                this.diagLastFrameTypes = (this.diagLastFrameTypes || []);
+                this.diagLastFrameTypes.push("?chunk:" + chunk.type);
+                if (this.diagLastFrameTypes.length > 6) this.diagLastFrameTypes.shift();
                 break;
             }
             case "assistant/message": {
