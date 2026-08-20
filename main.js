@@ -1514,24 +1514,51 @@ class DshNativeView extends ItemView {
         this.scheduleRender();
     }
 
-    // 修复 Bug 4：把工具调用 / 子代理 / 块开始结束等"非文本但用户该看到"的事件
+    // 修复 Bug 4：把工具调用 / 子代理 / 步骤等"非文本但用户该看到"的事件
     // 渲染成可滚动看的活动行（不挤进 assistantMd，避免触发 system-context 剥离）。
-    // 同名/同 id 的事件做折叠：start 显示一行进行中；end 在该行末尾追加"完成"标记。
+    // 同 id / 同 type+name 的事件折叠为一行：start 显示进行中；end 追加"完成"标记。
+    // block-start/block-end 是 DSH 内部包裹噪音（参考 fold.ts），直接丢弃。
+    // 超过 MAX_ACTIVITIES 张后不再创建新行，把多余计数累加到"已折叠"摘要行。
     appendActivity(chunk) {
         if (!this.assistantEl) this.beginAssistantBubble();
         const t = String(chunk.type || "");
+        // vscode fold.ts：block-* 直接 ignore；这里保持一致，避免流式每段都多一张卡片
+        if (t === "block-start" || t === "block-end") return;
         const data = (chunk && chunk.data) || {};
+        // 关键修复：fallback id 去掉 Math.random —— 否则每个流式 tool-call-delta 都会被当成新工具
+        // 改为 type+name 合并（同一 type+name 的所有 delta 折成一行）
         const id = String(
             data.toolCallId || data.callId || data.id
             || data.agentId || data.subagentId || data.sessionId
-            || (t + ":" + (data.name || data.toolName || "") + ":" + Math.random().toString(36).slice(2, 6))
+            || (t + ":" + (data.name || data.toolName || ""))
         );
         if (!this._activities) this._activities = new Map();
         // 活动行挂在 assistantContent 之外的兄弟节点，下次 renderAssistantNow 清空 assistantContent 时不会误删
         if (!this._activityHolder) {
             this._activityHolder = this.assistantEl.createDiv("dsh-activities");
         }
-        const finished = t.endsWith("-end") || t === "block-end";
+        // 数量上限：超过 5 张就累计到摘要行，不让一屏被工具调用刷满
+        const MAX_ACTIVITIES = 5;
+        let row = this._activities.get(id);
+        if (!row && this._activities.size >= MAX_ACTIVITIES) {
+            // 累加到第一张"已折叠"摘要行
+            let summary = this._activities.get("__overflow__");
+            if (!summary) {
+                summary = {};
+                summary.root = this._activityHolder.createDiv("dsh-activity is-active dsh-activity-overflow");
+                summary.icon = summary.root.createSpan("dsh-activity-icon"); summary.icon.textContent = "📦";
+                summary.text = summary.root.createSpan("dsh-activity-text");
+                summary.text.textContent = "更多活动";
+                summary.detail = summary.root.createSpan("dsh-activity-detail");
+                this._activities.set("__overflow__", summary);
+            }
+            summary._extraCount = (summary._extraCount || 0) + 1;
+            const finished = t.endsWith("-end");
+            summary.detail.textContent = " — 已折叠 " + summary._extraCount + " 个活动" + (finished ? "（含已完成）" : "（进行中）");
+            this.scrollToBottom();
+            return;
+        }
+        const finished = t.endsWith("-end");
         const label = (() => {
             if (t.startsWith("tool-")) return "🔧 调用工具：" + (data.name || data.toolName || "工具");
             if (t === "agent-start" || t === "agent-end") return "👥 Agent：" + (data.name || data.agentId || "");
@@ -1540,11 +1567,8 @@ class DshNativeView extends ItemView {
                 return "👥 子代理：" + (data.name || data.agentId || data.subagentId || "工作") + (task ? "（" + task.slice(0, 30) + "）" : "");
             }
             if (t === "step-start" || t === "step-end") return "📍 步骤：" + (data.title || data.name || data.step || "");
-            if (t === "block-start") return "▸ 块开始：" + (data.kind || data.type || "");
-            if (t === "block-end") return "▾ 块结束";
             return "· " + t;
         })();
-        let row = this._activities.get(id);
         if (!row) {
             row = {};
             row.root = this._activityHolder.createDiv("dsh-activity is-active");
@@ -1589,12 +1613,16 @@ class DshNativeView extends ItemView {
         contentEl.empty();
         // 思考折叠（<details>），对齐 VSCode DSH 的 thinking 折叠
         if (thinking) {
-            const det = contentEl.createEl("details", { cls: "dsh-thinking" });
-            const sum = det.createEl("summary");
-            sum.textContent = "💭 思考过程";
-            const tw = det.createDiv("dsh-thinking-body");
-            await MarkdownRenderer.render(this.app, thinking, tw, "", this);
-            this.postProcessDshUi(tw);
+            // thinking 也会被 DSH 注入运行时上下文（较罕见但发生过），渲染前先 strip
+            const cleanThinking = stripSystemContext(thinking) || "";
+            if (cleanThinking.trim()) {
+                const det = contentEl.createEl("details", { cls: "dsh-thinking" });
+                const sum = det.createEl("summary");
+                sum.textContent = "💭 思考过程";
+                const tw = det.createDiv("dsh-thinking-body");
+                await MarkdownRenderer.render(this.app, cleanThinking, tw, "", this);
+                this.postProcessDshUi(tw);
+            }
         }
         const body = contentEl.createDiv("dsh-msg-md");
         // 修复 Bug 1 + Bug 2：渲染前先剥系统上下文、把裸 JSON 包进 dsh-ui 代码块
@@ -1784,12 +1812,25 @@ class DshNativeView extends ItemView {
     }
 
     addUserBubbleFromEvent(ev) {
-        let text = "";
         const d = ev.data || ev;
+        let text = "";
         if (typeof d.text === "string") text = d.text;
-        else if (Array.isArray(d.content)) text = d.content.map((c) => (c && c.text) || "").join("");
-        else if (typeof d.content === "string") text = d.content;
-        if (text) this.addUserBubble(text);
+        else if (Array.isArray(d.content)) {
+            // vscode fold.ts extractUserText：用 \n\n join，让注入的段落与用户文本保持空行分隔，
+            // 否则段落级 stripSystemContext 会把注入合并到用户文本里、剥不掉
+            text = d.content.map((c) => (c && typeof c.text === "string") ? c.text : "").filter(Boolean).join("\n\n");
+        } else if (typeof d.content === "string") text = d.content;
+        if (!text) return;
+        // 剥注入（运行时快照/策略变更以 user/message 形式回推时必须 strip）
+        const cleaned = stripSystemContext(text);
+        if (!cleaned) return; // 整段都是注入就别渲染
+        // 去重：send() 已本地渲染过的、DSH 又回推的 user/message 不显示第二次
+        if (!this._userTextsSent) this._userTextsSent = new Set();
+        const key = cleaned.slice(0, 200);
+        if (this._userTextsSent.has(key)) return;
+        if (this._userTextsSent.size >= 32) this._userTextsSent.clear(); // 简单抗膨胀
+        this._userTextsSent.add(key);
+        this.addUserBubble(cleaned);
     }
 
     scrollToBottom() {
@@ -1895,6 +1936,12 @@ class DshNativeView extends ItemView {
     handleSessionEvent(ev) {
         if (!ev) return;
         switch (ev.type) {
+            case "user/message": {
+                // vscode fold.ts：user/message 走 stripSystemContext；这里补齐 Obsidian 漏掉的事件处理
+                // 注入的运行时快照/策略变更以独立 user/message 形式回推，必须 strip 后再渲染
+                this.addUserBubbleFromEvent(ev);
+                break;
+            }
             case "turn/start":
                 this.beginAssistantBubble();
                 break;

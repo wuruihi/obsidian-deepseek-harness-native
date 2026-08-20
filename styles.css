@@ -385,6 +385,7 @@
 }
 .dsh-activity.is-active { border-color: var(--interactive-accent); color: var(--text-normal); }
 .dsh-activity.is-done { opacity: 0.75; }
+.dsh-activity-overflow { border-style: dashed; font-style: italic; background: var(--background-secondary); }
 .dsh-activity-icon { flex: 0 0 auto; }
 .dsh-activity-text { font-weight: 600; }
 .dsh-activity-detail {
