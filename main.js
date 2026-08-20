@@ -966,13 +966,16 @@ class DshNativeView extends ItemView {
             this.modeBtnQueue.addEventListener("click", () => this.setMode("queue"));
             this.modeBtnSteer.addEventListener("click", () => this.setMode("steer"));
 
-            // 模型（session.models RPC 驱动）
+            // 提供方/模型（session.models RPC 驱动）
             this.modelLabel = this.controlsBar.createSpan("dsh-ctl-label");
-            this.modelLabel.textContent = "模型";
+            this.modelLabel.textContent = "提供方/模型";
             this.modelSelect = this.controlsBar.createEl("select", { cls: "dsh-model-select" });
             const phOpt = this.modelSelect.createEl("option", { value: "" });
             phOpt.textContent = "加载中…";
             this.modelSelect.disabled = true;
+            // 常驻「当前 提供方/模型」指示：收起下拉也能一眼看出当前用的是哪家提供方
+            this.modelCurrent = this.controlsBar.createSpan("dsh-model-current");
+            this.modelCurrent.textContent = "";
             this.modelSelect.addEventListener("change", () => {
                 const v = this.modelSelect.value;
                 if (!v) return;
@@ -1258,7 +1261,9 @@ class DshNativeView extends ItemView {
                     provider = provider || g.id || "";
                     if (!provider || !model) continue;
                     const effort = m.reasoning && m.reasoning.defaultEffort ? m.reasoning.defaultEffort : "";
-                    const labelParts = [m.name || model];
+                    // 选项文本带「提供方 / 模型」，收起下拉也能看到当前用的是哪家提供方（不同项目用不同提供方时尤其重要）
+                    const provName = g.name || g.id || provider;
+                    const labelParts = [provName + " / " + (m.name || model)];
                     if (m.description) labelParts.push(m.description);
                     const label = labelParts.join(" — ");
                     const opt = og.createEl("option", {
@@ -1277,6 +1282,8 @@ class DshNativeView extends ItemView {
             // 加载模型后静默把它纠正为规范 id；已正确则跳过（不会循环触发）。
             if (current && current.provider && current.model) {
                 const g = groups.find((gg) => gg.id === current.provider || gg.provider === current.provider);
+                const provName = (g && (g.name || g.id)) || current.provider;
+                if (this.modelCurrent) this.modelCurrent.textContent = provName + " / " + current.model;
                 const mm = g && Array.isArray(g.models) ? g.models.find((x) => (x.id || "").toLowerCase() === current.model.toLowerCase()) : null;
                 const canonical = mm && mm.id;
                 if (canonical && canonical !== current.model) {
@@ -1309,6 +1316,7 @@ class DshNativeView extends ItemView {
         if (!this.sessionId) return;
         try {
             await this.api.selectModel(this.sessionId, provider, model, effort);
+            if (this.modelCurrent) this.modelCurrent.textContent = provider + " / " + model;
             new Notice("已切换模型：" + provider + "/" + model);
         } catch (e) {
             new Notice("切换模型失败：" + (e && e.message ? e.message : String(e)));
