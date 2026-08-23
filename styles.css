@@ -334,9 +334,9 @@ select.dsh-chip-btn { max-width: 220px; }
 }
 .dsh-native-input {
     flex: 1 1 auto;
-    resize: none;
+    resize: vertical;       /* v0.5.1 对齐：可拉高，右下角拖拽 */
     min-height: 38px;
-    max-height: 180px;
+    max-height: 45vh;       /* 视口 45% 上限（VSCode 同款比例，替代写死的 180px） */
     /* 用表单字段背景 + 边框，明确“这是一个可输入的框”（之前用 background-secondary 偏灰、看不出可输入） */
     background: var(--background-modifier-form-field);
     color: var(--text-normal);
@@ -573,6 +573,8 @@ select.dsh-chip-btn { max-width: 220px; }
     line-height: 1.55;
     color: var(--text-normal);
     max-width: 100%;
+    min-width: 0;               /* v0.4.7 对齐：长文本不再撑破卡片 */
+    overflow-wrap: anywhere;    /* 同上；代码块/表格保留各自的横向滚动 */
     overflow-x: auto;
 }
 .dui-title { font-size: var(--font-ui-small); font-weight: 700; color: var(--text-normal); padding-bottom: 6px; border-bottom: 1px solid var(--background-modifier-border); }

@@ -58,6 +58,7 @@ const DEFAULT_SETTINGS = {
     openPanelOnSend: false, // 发送后自动打开/聚焦 DSH 面板
     manualTitles: {}, // 会话手动重命名覆盖表：{ [sessionId]: 自定义标题 }，持久化以跨重启保留
     autoTitles: {}, // DSH 自动命名的缓存（session.list 不带 title，探测 history 尾页投影后缓存，跨重启保留）
+    modelMemory: {}, // 按工作区记忆默认模型（v0.5.2 对齐）：{ [workspaceId]: {provider, model} }，新会话只继承本项目的
 };
 
 /* ====================================================================
@@ -1108,11 +1109,54 @@ function wrapDshUiJson(text) {
 // 解决 Bug 2：流式期间 JSON 未闭合 → 原 wrapDshUiJson 平衡括号失败 → 裸 JSON 泄漏。
 // 这里负责「解析失败时的占位」，配合下方 postProcessDshUi。
 // ====================================================================
+/* ==== FENCE-PURE-BEGIN（纯函数区：node scripts/fence-regress.mjs 会整段提取跑回归）==== */
 // 智能引号 → 直引号；删除 ] / } 前的尾随逗号
 function cheapRepairs(s) {
     return s.replace(/[\u201c\u201d]/g, '"').replace(/[\u2018\u2019]/g, "'").replace(/,\s*([}\]])/g, "$1");
 }
-// 从 start 扫描一个完整 JSON 值，返回 [endIndex, value] 或 null（尊重字符串/转义/嵌套括号）
+// 括号平衡修复（对齐 VSCode dshui.tsx balanceClose，v0.4.11）：
+// `}` 到来时栈顶是 `[`（合法 JSON 不可能的形态——模型提前闭 root 漏关 items）→ 补 `]`；
+// 结束时还有开的容器（截断尾巴）→ 全部自动闭合。上限 8 处；字符串中间截断绝不猜。
+function balanceClose(s) {
+    const stack = [];
+    let out = "";
+    let inStr = false;
+    let esc = false;
+    let fixes = 0;
+    for (const ch of s) {
+        if (inStr) {
+            out += ch;
+            if (esc) esc = false;
+            else if (ch === "\\") esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') { inStr = true; out += ch; continue; }
+        if (ch === "{" || ch === "[") { stack.push(ch); out += ch; continue; }
+        if (ch === "}") {
+            if (stack[stack.length - 1] === "[") {
+                if (++fixes > 8) return null;
+                out += "]";
+                stack.pop();
+            }
+            if (stack.pop() !== "{") return null;
+            out += ch;
+            continue;
+        }
+        if (ch === "]") {
+            if (stack.pop() !== "[") return null;
+            out += ch;
+            continue;
+        }
+        out += ch;
+    }
+    if (inStr) return null;
+    while (stack.length) out += stack.pop() === "{" ? "}" : "]";
+    return out;
+}
+// 从 start 扫描一个完整 JSON 值，返回 [endIndex, value] 或 null（尊重字符串/转义/嵌套括号）。
+// endIndex 越过闭合符（对齐 VSCode scanValue 的 k+1 语义——调用方要从该处继续扫孤儿值）。
+// 平衡但非法（如 items [ 被 root 提前闭合卡住）时先用 balanceClose 修一轮再放弃（v0.4.11）。
 function scanJsonValue(text, start) {
     let i = start;
     const n = text.length;
@@ -1123,32 +1167,50 @@ function scanJsonValue(text, start) {
     let depth = 0;
     let inStr = false;
     let esc = false;
-    let j = i;
-    while (j < n) {
+    for (let j = i; j < n; j++) {
         const c = text[j];
-        if (esc) { esc = false; j++; continue; }
-        if (c === "\\") { esc = true; j++; continue; }
-        if (c === '"') { inStr = !inStr; j++; continue; }
-        if (inStr) { j++; continue; }
-        if (c === "{") { depth++; j++; continue; }
-        if (c === "[") { depth++; j++; continue; }
-        if (c === "}") { depth--; j++; if (depth === 0) break; continue; }
-        if (c === "]") { depth--; j++; if (depth === 0) break; continue; }
-        j++;
+        if (esc) { esc = false; continue; }
+        if (c === "\\") { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === "{" || c === "[") depth++;
+        else if (c === "}" || c === "]") {
+            depth--;
+            if (depth === 0) {
+                const slice = text.slice(i, j + 1);
+                try { return [j + 1, JSON.parse(slice)]; } catch (_e) {}
+                const balanced = balanceClose(slice);
+                if (balanced) {
+                    try { return [j + 1, JSON.parse(balanced)]; } catch (_e) {}
+                }
+                return null;
+            }
+        }
     }
-    if (depth !== 0) return null;
-    const slice = text.slice(i, j);
-    try { return [j, JSON.parse(cheapRepairs(slice))]; } catch (_e) { return null; }
+    return null; // 括号从未归零：流式半截或截断
 }
-// 根对象提前闭合、后续组件变孤儿值：补回 root.items（DSH 偶发畸形 fences）
+// 根形态修复（对齐 VSCode repairSpec，v0.4.12）：支持三种 root——
+// ① {items:[…]} 信封 ② 裸 [组件…] 数组 ③ 裸组件序列（无外壳无分隔）——后两种自动包壳。
+// root 完整后的非结构尾巴（漏闭合栏吞进的正文）直接忽略；孤儿值合并回 items。
 function repairSpec(raw) {
     const text = raw.trim();
-    if (!text.startsWith("{")) return null;
+    if (!text.startsWith("{") && !text.startsWith("[")) return null;
     const first = scanJsonValue(text, 0);
     if (!first) return null;
     const [end1, v1] = first;
-    const root = v1;
-    if (!root || typeof root !== "object" || !Array.isArray(root.items)) return null;
+    let root;
+    let componentMode = false;
+    if (Array.isArray(v1)) {
+        root = { items: v1 };
+        componentMode = true;
+    } else if (v1 && typeof v1 === "object" && Array.isArray(v1.items)) {
+        root = v1;
+    } else if (v1 && typeof v1 === "object" && typeof v1.type === "string") {
+        root = { items: [v1] };
+        componentMode = true;
+    } else {
+        return null;
+    }
     let pos = end1;
     const orphans = [];
     let guard = 0;
@@ -1156,31 +1218,142 @@ function repairSpec(raw) {
         while (pos < text.length && /[\s,]/.test(text[pos])) pos++;
         if (pos >= text.length) break;
         if (text[pos] === "]" || text[pos] === "}") {
-            if (/^[\]}]+$/.test(text.slice(pos))) break;
-            return null;
+            if (/^[\]}]+$/.test(text.slice(pos))) break; // 尾部游离闭合符
+            return null; // 看不懂的结构形态——宁可放弃也不猜
         }
+        // 未闭合围栏吞正文：spec JSON 已完整、模型的正文继续留在栏内——
+        // 非结构（非 {/[）开头就是正文污染，root 本身有效，忽略尾巴（v0.4.11 正文容忍）
+        if (text[pos] !== "{" && text[pos] !== "[") break;
         const nxt = scanJsonValue(text, pos);
-        if (!nxt) return null;
-        orphans.push(nxt[1]);
+        if (!nxt) break; // 解析不了的孤儿：保住已有的，丢掉尾巴（不整体报废）
+        const v = nxt[1];
+        if (componentMode && Array.isArray(v)) orphans.push(...v);
+        else if (componentMode && v && typeof v === "object" && Array.isArray(v.items)) orphans.push(...v.items);
+        else if (v && typeof v === "object") orphans.push(v);
+        else break;
         pos = nxt[0];
     }
-    if (orphans.length === 0) return null;
-    root.items = [...root.items, ...orphans];
+    if (orphans.length > 0) root.items = [...root.items, ...orphans];
     return root;
 }
 function parseSpec(raw) {
     if (typeof raw !== "string") return null;
-    try { const v = JSON.parse(raw); return v && typeof v === "object" ? v : null; } catch (_e) {}
-    try { const v = JSON.parse(cheapRepairs(raw)); return v && typeof v === "object" ? v : null; } catch (_e) {}
-    return repairSpec(cheapRepairs(raw));
+    // v0.4.12 对齐：裸数组 / 单个裸组件在任意层级解析成功后都包壳成 {items:[…]}，
+    // 否则 postProcessDshUi 的 items 判定会把它们当失败
+    const norm = (v) => {
+        if (Array.isArray(v)) return { items: v };
+        if (v && typeof v === "object" && !Array.isArray(v.items) && typeof v.type === "string") return { items: [v] };
+        return v;
+    };
+    try { const v = JSON.parse(raw); return v && typeof v === "object" ? norm(v) : null; } catch (_e) {}
+    const cheap = cheapRepairs(raw);
+    try { const v = JSON.parse(cheap); return v && typeof v === "object" ? norm(v) : null; } catch (_e) {}
+    // 截断尾巴：栏落定时容器还开着 → 自动闭合再试（v0.4.11）
+    const closed = balanceClose(cheap);
+    if (closed) {
+        try { const v = JSON.parse(closed); return v && typeof v === "object" ? norm(v) : null; } catch (_e) {}
+    }
+    return repairSpec(cheap);
 }
 
-// 入口：先剥系统块，再把 JSON 包进 dsh-ui 代码块
+// ---- 结构化围栏切分器（对齐 VSCode markdown.tsx splitDshUiSegments，v0.5.0）----
+// 在进 MarkdownRenderer 之前就把 dsh-ui 段切出来：围栏边界 = 「开栏符之后第一个括号平衡的
+// JSON 值」，与 CommonMark 围栏语义解耦——开栏符粘句尾、漏写闭合栏、栏内混正文等崩法
+// 统一走同一条管道。逐行扫描带普通代码围栏状态，代码示例里的字面 ```dsh-ui 不会误触发。
+/** pos 起跳过空白后的首个 { 或 [ 下标；无则 -1 */
+function specStart(s, pos) {
+    let i = pos;
+    while (i < s.length && /\s/.test(s[i])) i++;
+    return s[i] === "{" || s[i] === "[" ? i : -1;
+}
+/** pos 处括号平衡 JSON 值的结束下标（越过该值）；字符串感知、{}[] 混合计数。只管平衡，合法性归 parseSpec */
+function balancedEnd(s, pos) {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let k = pos; k < s.length; k++) {
+        const ch = s[k];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === "\\") esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === "{" || ch === "[") depth++;
+        else if (ch === "}" || ch === "]") {
+            depth--;
+            if (depth === 0) return k + 1;
+        }
+    }
+    return -1;
+}
+/** 把助手文本切成 {kind:"text"|"fence", text} 段；fence 段是裸 spec 文本 */
+function splitDshUiSegments(text) {
+    if (!text.includes("```dsh-ui")) return [{ kind: "text", text }];
+    const lines = text.split("\n");
+    // 找普通围栏之外的第一个 dsh-ui 开栏符
+    let inPlainFence = false;
+    let openerLine = -1;
+    let prosePrefix = [];
+    for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        if (inPlainFence) {
+            if (/^\s*```/.test(line)) inPlainFence = false;
+            continue;
+        }
+        const hit = line.indexOf("```dsh-ui");
+        if (hit >= 0) {
+            openerLine = li;
+            const prefix = line.slice(0, hit);
+            if (prefix.trim()) prosePrefix.push(prefix);
+            break;
+        }
+        if (/^\s*```/.test(line)) inPlainFence = true;
+        else prosePrefix.push(line);
+    }
+    if (openerLine < 0) return [{ kind: "text", text }];
+    const segs = [];
+    if (prosePrefix.length > 0) segs.push({ kind: "text", text: prosePrefix.join("\n") });
+    const rest = lines.slice(openerLine + 1).join("\n");
+    const start = specStart(rest, 0);
+    if (start < 0) {
+        // 开栏符后面根本没有 JSON：整行当正文
+        const rebuilt = [...prosePrefix, lines[openerLine], ...lines.slice(openerLine + 1)].join("\n");
+        return [{ kind: "text", text: rebuilt }];
+    }
+    const end = balancedEnd(rest, start);
+    if (end < 0) {
+        // 永不平衡：流式半截或被截断——其余全归 fence（由占位/修复层接管）
+        segs.push({ kind: "fence", text: rest.slice(start) });
+        return segs;
+    }
+    segs.push({ kind: "fence", text: rest.slice(start, end) });
+    // 平衡点之后：吃掉一个紧随的闭合栏（若有），再递归处理余下文本（嵌套普通围栏状态才正确）
+    let tail = rest.slice(end);
+    const tm = /^[ \t]*\r?\n?[ \t]*```[^\n]*\n?/.exec(tail);
+    if (tm) tail = tail.slice(tm[0].length);
+    else tail = tail.replace(/^([ \t]*)```/, "$1"); // 同行闭合：`} ``` `
+    const tailSegs = tail.trim() ? splitDshUiSegments(tail) : [];
+    return [...segs, ...tailSegs];
+}
+/* ==== FENCE-PURE-END ==== */
+
+// 入口：先剥系统块，再走 v0.5.0 同款结构化切分——fence 段重排成规范 dsh-ui 代码块；
+// 纯文本段保留 wrapDshUiJson 兜底（无栏裸 JSON 自动包栏，Obsidian 原有能力不回退）
 function preprocessAssistantText(text) {
     if (!text) return text;
-    let s = stripSystemContext(text);
-    s = wrapDshUiJson(s);
-    return s;
+    const s = stripSystemContext(text);
+    const segs = splitDshUiSegments(s);
+    let out = "";
+    for (const seg of segs) {
+        if (seg.kind === "fence") {
+            out += "\n```dsh-ui\n" + seg.text.trim() + "\n```\n";
+        } else {
+            out += wrapDshUiJson(seg.text);
+        }
+    }
+    return out;
 }
 
 // 子代理换脸（移植自 VSCode fold.ts:319）：本宿主把子代理委派伪装成普通 tool/call
@@ -1634,6 +1807,7 @@ class DshNativeView extends ItemView {
             this.sessions = [{ sessionId: s.sessionId, title: "新会话", blank: true }];
             this.openTabs = [s.sessionId];
             this.setSession(s.sessionId);
+            void this.applyModelMemory(s.sessionId);
         }
         this.renderSessionList();
         this.updateTitleBtn();
@@ -1768,6 +1942,7 @@ class DshNativeView extends ItemView {
                     this.sessions = [{ sessionId: s.sessionId, title: "新会话", blank: true }];
                     this.openTabs = [s.sessionId];
                     this.setSession(s.sessionId);
+                    void this.applyModelMemory(s.sessionId);
                 } catch (_e) { /* 极端情况：保留当前态 */ }
             }
         }
@@ -1913,6 +2088,25 @@ class DshNativeView extends ItemView {
         this.sessions.unshift({ sessionId: s.sessionId, title: "新会话", blank: true });
         this.openSessionAsTab(s.sessionId);
         this.updateTitleBtn();
+        void this.applyModelMemory(s.sessionId);
+    }
+
+    // v0.5.2 对齐：新建会话时主动应用本工作区记忆的默认模型（宿主原生行为是全局最近一次
+    // 会话的模型，并行项目会互相污染）；模型下架导致应用失败 → 清记忆自愈
+    async applyModelMemory(sessionId) {
+        try {
+            const wsId = this.workspace && this.workspace.workspaceId;
+            const mem = wsId && this.plugin.settings.modelMemory ? this.plugin.settings.modelMemory[wsId] : null;
+            if (!mem || !mem.provider || !mem.model) return;
+            await this.api.selectModel(sessionId, mem.provider, mem.model);
+            this.loadModels(); // 让当前下拉反映应用后的值
+        } catch (_e) {
+            const wsId = this.workspace && this.workspace.workspaceId;
+            if (wsId && this.plugin.settings.modelMemory) {
+                delete this.plugin.settings.modelMemory[wsId];
+                try { await this.plugin.saveSettings(); } catch (_e2) {}
+            }
+        }
     }
 
     /* ---------- 模式 / 模型 / 权限 ---------- */
@@ -2061,6 +2255,18 @@ class DshNativeView extends ItemView {
             }
             // 思考强度下拉跟随当前模型（对齐 VSCode EffortPicker）
             this.renderEfforts(current, groups);
+            // v0.5.2 对齐：本项目真实会话（非空白）的当前模型也作为工作区记忆来源
+            const wsId = this.workspace && this.workspace.workspaceId;
+            if (wsId && current && current.provider && current.model && this.plugin.settings.modelMemory) {
+                const sRow = this.sessions.find((x) => x.sessionId === this.sessionId);
+                if (sRow && !sRow.blank) {
+                    const mem = this.plugin.settings.modelMemory[wsId];
+                    if (!mem || mem.provider !== current.provider || mem.model !== current.model) {
+                        this.plugin.settings.modelMemory[wsId] = { provider: current.provider, model: current.model };
+                        try { await this.plugin.saveSettings(); } catch (_e) {}
+                    }
+                }
+            }
         } catch (_e) {
             this.modelSelect.empty();
             const o = this.modelSelect.createEl("option", { value: "" });
@@ -2101,6 +2307,12 @@ class DshNativeView extends ItemView {
         try {
             await this.api.selectModel(this.sessionId, provider, model, effort);
             new Notice("已切换模型：" + provider + "/" + model);
+            // v0.5.2 对齐：手动切模型 → 记入本工作区记忆（新会话只继承本项目的，不吃宿主全局最近值）
+            const wsId = this.workspace && this.workspace.workspaceId;
+            if (wsId && this.plugin.settings.modelMemory) {
+                this.plugin.settings.modelMemory[wsId] = { provider, model };
+                try { await this.plugin.saveSettings(); } catch (_e) {}
+            }
             // 重拉目录：不同模型的 reasoning.efforts 不同，思考强度下拉要跟随
             await this.loadModels();
         } catch (e) {
@@ -2821,10 +3033,12 @@ class DshNativeView extends ItemView {
             const cls = (code.className || "") + " " + (code.getAttribute("data-language") || "") + " " + (code.getAttribute("lang") || "");
             const text = (code.textContent || "").trim();
             const isDshUi = /dsh-ui/i.test(cls);
-            const looksLikeSpec = text.startsWith("{") && (text.includes('"items"') || text.includes('"type"') || text.includes('"title"'));
+            // 裸数组/裸组件序列形态（v0.4.12）以 [ 开头，也要进解析
+            const looksLikeSpec = (text.startsWith("{") || text.startsWith("[")) && (text.includes('"items"') || text.includes('"type"') || text.includes('"title"'));
             if (!isDshUi && !looksLikeSpec) return;
             const spec = parseSpec(text);
-            if (spec && Array.isArray(spec.items) && (typeof spec.type === "string" || typeof spec.title === "string")) {
+            // 包壳后的裸数组/序列没有 type/title 字段，只要 items 是数组就接受
+            if (spec && Array.isArray(spec.items)) {
                 let html;
                 try { html = dshUiRenderSpec(spec); } catch (_e) { return; }
                 const wrap = document.createElement("div");
