@@ -1414,7 +1414,7 @@ class DshNativeView extends ItemView {
 
             // 权限（对齐 VSCode：会话级预设，经 /permission 命令立即生效；选项初值来自 settings.describe，实时值由投影更新）
             // chip-btn 下拉，无前缀（对齐 VSCode）
-            this.permSelect = this.controlsBar.createEl("select", { cls: "dsh-chip-btn dsh-perm-select" });
+            this.permSelect = this.controlsBar.createEl("select", { cls: "dsh-chip-btn dsh-perm-select", attr: { title: "权限预设（当前会话，立即生效）" } });
             const ph = this.permSelect.createEl("option", { value: "" });
             ph.textContent = "加载中…";
             this.permSelect.disabled = true;
