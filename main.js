@@ -1793,7 +1793,12 @@ class DshNativeView extends ItemView {
     toggleSessionList(force) {
         if (!this.sessionList) return;
         const show = force === undefined ? (this.sessionList.style.display === "none") : force;
-        if (show) { this.renderSessionList(); this.sessionList.style.display = "block"; }
+        if (show) {
+            this.renderSessionList();
+            this.sessionList.style.display = "block";
+            // 展开时顺手补一轮标题探测（后台异步，学到新名字会自动重渲染）
+            void this.enrichSessionsInBackground();
+        }
         else this.sessionList.style.display = "none";
     }
 
