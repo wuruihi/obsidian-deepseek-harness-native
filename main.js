@@ -56,6 +56,7 @@ const DEFAULT_SETTINGS = {
     installUrl: DEFAULT_DSH_REPO_URL, // 克隆地址（国内可换 gh-proxy 镜像）
     selectionButton: false, // 框选后显示「发送到 DSH」浮动按钮
     openPanelOnSend: false, // 发送后自动打开/聚焦 DSH 面板
+    manualTitles: {}, // 会话手动重命名覆盖表：{ [sessionId]: 自定义标题 }，持久化以跨重启保留
 };
 
 /* ====================================================================
@@ -397,6 +398,166 @@ function normPath(p) {
 function dshUiEsc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+// ====================================================================
+// Phase I：mermaid / plot 自研 SVG 渲染（移植自 VSCode dshui.tsx / mermaid.tsx）
+// 不依赖 mermaid.js；mermaid 仅支持 flowchart 子集（graph TD/LR），plot 仅接受白名单数学表达式。
+// 解析失败一律降级为代码块，绝不崩。
+// ====================================================================
+
+// 白名单编译 plot 表达式 f(x)：只允许数学函数与常量，杜绝任意代码执行
+function dshUiCompileExpr(expr) {
+    const src = String(expr == null ? "" : expr).trim();
+    if (!src || src.length > 200) return null;
+    if (!/^[-+*/%().,\d\sxA-Fa-f]|^(sin|cos|tan|asin|acos|atan|sqrt|cbrt|exp|log|ln|abs|floor|ceil|round|min|max|pow|pi|tau|e|x)/.test(src)) return null;
+    const idents = src.match(/[A-Za-z]+/g) || [];
+    const ALLOWED = new Set(["sin", "cos", "tan", "asin", "acos", "atan", "sqrt", "cbrt", "exp", "log", "ln", "abs", "floor", "ceil", "round", "min", "max", "pow", "pi", "tau", "e", "x"]);
+    for (const id of idents) if (!ALLOWED.has(id)) return null;
+    try {
+        const f = new Function('"use strict"; const {sin,cos,tan,asin,acos,atan,sqrt,cbrt,exp,abs,floor,ceil,round,min,max,pow}=Math; const log=Math.log, ln=Math.log, pi=Math.PI, tau=Math.PI*2, e=Math.E; return (x) => (' + src + ');')();
+        if (typeof f(1) !== "number") return null;
+        return f;
+    } catch (_e) { return null; }
+}
+
+// mermaid flowchart 子集 → SVG 字符串；无法解析返回 null
+function dshUiMermaidSvg(code) {
+    const lines = String(code == null ? "" : code).split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("%%"));
+    if (!lines.length) return null;
+    const m = /^(?:graph|flowchart)\s+(TD|TB|LR|RL)/i.exec(lines[0]);
+    if (!m) return null;
+    const lr = /^(LR|RL)$/i.test(m[1]);
+    const nodes = new Map();
+    const edges = [];
+    const edgeRe = /^([\w-]+)\s*(\[[^\]]*\]|\([^)]*\)|\{[^}]*\})?\s*(-{2,3}>|-\.->)\s*([\w-]+)\s*(\[[^\]]*\]|\([^)]*\)|\{[^}]*\})?(?:\s*\|([^|]+)\|)?$/;
+    const plainRe = /^([\w-]+)\s*(\[\[.*\]\]|\[.*\]|\(.*\)|\{.*\})$/;
+    const labelRe = /^([\w-]+)\s*(-{2,3}>|-\.->)\s*\|([^|]+)\|\s*([\w-]+)\s*(\[[^\]]*\]|\([^)]*\))?$/;
+    const labelOf = (raw) => {
+        if (!raw) return { text: "", shape: "rect" };
+        if (raw.startsWith("[[") && raw.endsWith("]]")) return { text: raw.slice(2, -2), shape: "rect" };
+        if (raw.startsWith("[") && raw.endsWith("]")) return { text: raw.slice(1, -1), shape: "round" };
+        if (raw.startsWith("(") && raw.endsWith(")")) return { text: raw.slice(1, -1), shape: "stadium" };
+        return { text: raw.slice(1, -1), shape: "rect" };
+    };
+    const upsert = (id, raw) => {
+        const info = labelOf(raw);
+        const ex = nodes.get(id);
+        if (!ex) nodes.set(id, { id, label: info.text || id, shape: info.shape });
+        else if (info.text) ex.label = info.text;
+    };
+    for (const line of lines.slice(1)) {
+        const em = edgeRe.exec(line);
+        if (em) { upsert(em[1], em[2]); upsert(em[4], em[5]); edges.push({ from: em[1], to: em[4], label: em[6] ? em[6].trim() : undefined, dashed: em[3].indexOf(".") >= 0 }); continue; }
+        const pm = plainRe.exec(line);
+        if (pm) { upsert(pm[1], pm[2]); continue; }
+        const lm = labelRe.exec(line);
+        if (lm) { upsert(lm[1]); upsert(lm[4], lm[5]); edges.push({ from: lm[1], to: lm[4], label: lm[3] ? lm[3].trim() : undefined, dashed: lm[2].indexOf(".") >= 0 }); }
+    }
+    if (nodes.size === 0) return null;
+    // 最长路径分层布局（容忍环）
+    const NODE_W = 150, NODE_H = 44, GAP_Y = 76, GAP_X = 190;
+    const depth = new Map();
+    const byId = new Map([...nodes.values()].map((nn) => [nn.id, nn]));
+    const setDepth = (id, d, seen) => {
+        if (seen.has(id)) return;
+        seen.add(id);
+        const cur = depth.get(id) || 0;
+        depth.set(id, Math.max(cur, d));
+        for (const e of edges.filter((x) => x.from === id)) if (byId.has(e.to)) setDepth(e.to, d + 1, seen);
+    };
+    const targets = new Set(edges.map((e) => e.to));
+    for (const nn of nodes.values()) if (!targets.has(nn.id)) setDepth(nn.id, 0, new Set());
+    for (const nn of nodes.values()) if (depth.get(nn.id) === undefined) depth.set(nn.id, 0);
+    const layers = new Map();
+    for (const nn of nodes.values()) {
+        const d = depth.get(nn.id) || 0;
+        const arr = layers.get(d) || [];
+        arr.push(nn.id);
+        layers.set(d, arr);
+    }
+    const pos = new Map();
+    for (const [d, ids] of layers) {
+        ids.forEach((id, i) => {
+            const lane = i - (ids.length - 1) / 2;
+            pos.set(id, { x: lr ? d * GAP_X : lane * GAP_X, y: lr ? lane * GAP_Y : d * GAP_Y });
+        });
+    }
+    const xs = [...pos.values()].map((p) => p.x), ys = [...pos.values()].map((p) => p.y);
+    const minX = Math.min(...xs) - NODE_W / 2 - 20, maxX = Math.max(...xs) + NODE_W / 2 + 20;
+    const minY = Math.min(...ys) - NODE_H / 2 - 20, maxY = Math.max(...ys) + NODE_H / 2 + (edges.some((e) => e.label) ? 30 : 20);
+    const w = maxX - minX, h = maxY - minY;
+    const edgePath = (from, to) => {
+        const a = pos.get(from), b = pos.get(to);
+        if (!a || !b) return "";
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        if (lr) return "M " + (a.x + NODE_W / 2) + " " + a.y + " C " + mx + " " + a.y + ", " + mx + " " + b.y + ", " + (b.x - NODE_W / 2) + " " + b.y;
+        return "M " + a.x + " " + (a.y + NODE_H / 2) + " C " + a.x + " " + my + ", " + b.x + " " + my + ", " + b.x + " " + (b.y - NODE_H / 2);
+    };
+    let svg = '<div class="dui-mermaid-wrap"><svg viewBox="' + minX + " " + minY + " " + w + " " + h + '" width="100%" style="max-height:420">';
+    svg += '<defs><marker id="dui-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/></marker></defs>';
+    for (const e of edges) {
+        const d = edgePath(e.from, e.to);
+        if (!d) continue;
+        svg += '<path d="' + d + '" fill="none" stroke="currentColor" stroke-opacity="0.55" stroke-width="1.4"' + (e.dashed ? ' stroke-dasharray="5 4"' : "") + ' marker-end="url(#dui-arrow)"/>';
+        if (e.label) {
+            const a = pos.get(e.from), b = pos.get(e.to);
+            svg += '<text x="' + ((a.x + b.x) / 2) + '" y="' + ((a.y + b.y) / 2 - 6) + '" text-anchor="middle" class="dui-edge-label">' + dshUiEsc(e.label) + "</text>";
+        }
+    }
+    for (const nn of nodes.values()) {
+        const p = pos.get(nn.id);
+        const rx = nn.shape === "stadium" ? NODE_H / 2 : nn.shape === "round" ? 10 : 4;
+        const lbl = nn.label.length > 16 ? nn.label.slice(0, 15) + "…" : nn.label;
+        svg += '<g transform="translate(' + (p.x - NODE_W / 2) + "," + (p.y - NODE_H / 2) + ')"><rect width="' + NODE_W + '" height="' + NODE_H + '" rx="' + rx + '" class="dui-mnode"/><text x="' + (NODE_W / 2) + '" y="' + (NODE_H / 2 + 4) + '" text-anchor="middle" class="dui-mnode-label">' + dshUiEsc(lbl) + "</text></g>";
+    }
+    svg += "</svg></div>";
+    return svg;
+}
+
+// plot 函数图 → SVG 字符串；无有效序列返回 null
+function dshUiPlotSvg(node) {
+    const width = 460, height = 240, pad = 28;
+    const xMin = typeof node.xMin === "number" ? node.xMin : -5;
+    const xMax = typeof node.xMax === "number" ? node.xMax : 5;
+    const PALETTE = ["#3794ff", "#3fb950", "#d29922", "#f47067", "#bc8cff", "#39c5cf"];
+    const series = Array.isArray(node.series) ? node.series : [];
+    const compiled = [];
+    for (const s of series) {
+        const expr = String(s && s.expr != null ? s.expr : "");
+        const f = dshUiCompileExpr(expr);
+        if (f) compiled.push({ f, expr, label: s && s.label });
+    }
+    if (!compiled.length) return null;
+    let lo = Infinity, hi = -Infinity;
+    for (const s of compiled) for (let i = 0; i <= 200; i++) {
+        const v = s.f(xMin + ((xMax - xMin) * i) / 200);
+        if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    }
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo === hi) { const mid = Number.isFinite(lo) ? lo : 0; lo = mid - 1; hi = mid + 1; }
+    else { const margin = (hi - lo) * 0.08; lo -= margin; hi += margin; }
+    const sx = (x) => pad + ((x - xMin) / (xMax - xMin)) * (width - 2 * pad);
+    const sy = (y) => height - pad - ((y - lo) / (hi - lo)) * (height - 2 * pad);
+    let svg = '<div class="dui-plot-wrap">';
+    if (node.title) svg += '<div class="dui-text dui-text-h3">' + dshUiEsc(String(node.title)) + "</div>";
+    svg += '<svg viewBox="0 0 ' + width + " " + height + '" width="100%">';
+    svg += '<rect x="' + pad + '" y="' + pad + '" width="' + (width - 2 * pad) + '" height="' + (height - 2 * pad) + '" fill="none" stroke="currentColor" stroke-opacity="0.2" rx="6"/>';
+    if (lo < 0 && hi > 0) svg += '<line x1="' + pad + '" x2="' + (width - pad) + '" y1="' + sy(0) + '" y2="' + sy(0) + '" stroke="currentColor" stroke-opacity="0.25"/>';
+    if (xMin < 0 && xMax > 0) svg += '<line x1="' + sx(0) + '" x2="' + sx(0) + '" y1="' + pad + '" y2="' + (height - pad) + '" stroke="currentColor" stroke-opacity="0.25"/>';
+    compiled.forEach((s, i) => {
+        const pts = [];
+        for (let k = 0; k <= 200; k++) {
+            const x = xMin + ((xMax - xMin) * k) / 200;
+            const y = s.f(x);
+            if (Number.isFinite(y)) pts.push(sx(x) + "," + sy(y));
+        }
+        svg += '<polyline points="' + pts.join(" ") + '" fill="none" stroke="' + PALETTE[i % PALETTE.length] + '" stroke-width="1.8"/>';
+    });
+    svg += "</svg>";
+    svg += '<div class="dui-plot-legend">';
+    compiled.forEach((s, i) => { svg += '<span class="dui-dot" style="background:' + PALETTE[i % PALETTE.length] + '"></span>' + dshUiEsc(s.label ? String(s.label) : s.expr); });
+    svg += "</div></div>";
+    return svg;
+}
+
 function dshUiRenderNode(n, deep) {
     if (n == null) return "";
     const t = n.type || "";
@@ -517,11 +678,16 @@ function dshUiRenderNode(n, deep) {
             const extra = n.content ? " — " + n.content : "";
             return '<span class="dui-ro-input">🔒 ' + dshUiEsc(label) + dshUiEsc(extra) + "</span>";
         }
-        case "mermaid":
-            return '<div class="dui-callout dui-co-info"><div class="dui-callout-title">Mermaid 图</div><div class="dui-callout-content">图表在网页版查看。\n' + dshUiEsc(n.code || "") + "</div></div>";
-        case "plot":
+        case "mermaid": {
+            const svg = dshUiMermaidSvg(n.code);
+            return svg || '<div class="dui-callout dui-co-info"><div class="dui-callout-title">Mermaid 图</div><div class="dui-callout-content">' + dshUiEsc(n.code || "") + "</div></div>";
+        }
+        case "plot": {
+            const svg = dshUiPlotSvg(n);
+            return svg || '<div class="dui-callout dui-co-info"><div class="dui-callout-title">函数图</div><div class="dui-callout-content">该组件无法在本地渲染（表达式不支持或超出白名单）。</div></div>';
+        }
         case "scene3d":
-            return '<div class="dui-callout dui-co-info"><div class="dui-callout-title">' + (t === "plot" ? "函数图" : "3D 场景") + '</div><div class="dui-callout-content">该组件仅在网页版渲染。</div></div>';
+            return '<div class="dui-callout dui-co-info"><div class="dui-callout-title">3D 场景</div><div class="dui-callout-content">该组件仅在网页版渲染。</div></div>';
         case "avatar":
             return '<span class="dui-badge">👤 ' + dshUiEsc(n.name || "") + "</span>";
         case "breadcrumb":
@@ -606,18 +772,28 @@ class DshApi {
             .filter((i) => !archived.has(i.sessionId))
             .filter((i) => i.origin !== "subagent")
             .filter((i) => !i.blank)
-            // 把后端返回的 title 拾起来；空 title 的留给 UI 显示「未命名」
-            .map((i) => ({ sessionId: i.sessionId, title: typeof i.title === "string" ? i.title : "", updatedAt: i.updatedAt }))
+            // 把后端返回的 title 拾起来；空 title 的留给 UI 显示「未命名」；agentPreset/blank 供头部模式选择器用
+            .map((i) => ({
+                sessionId: i.sessionId,
+                title: typeof i.title === "string" ? i.title : "",
+                updatedAt: i.updatedAt,
+                blank: !!i.blank,
+                agentPreset: typeof i.agentPreset === "string" ? i.agentPreset : undefined,
+            }))
             .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     }
     async createSession(workspaceId) {
         return this.call("session.create", { workspaceId });
     }
-    async prompt(sessionId, text, mode = "queue") {
+    async prompt(sessionId, textOrParts, mode = "queue") {
+        // 支持字符串（向后兼容）或 content parts 数组（含 file/image 附件）
+        const content = Array.isArray(textOrParts)
+            ? textOrParts
+            : [{ type: "text", text: textOrParts }];
         return this.call("session.prompt", {
             sessionId,
             mode,
-            content: [{ type: "text", text }],
+            content,
         });
     }
     async getModels(sessionId) {
@@ -664,11 +840,75 @@ class DshApi {
             /* ignore */
         }
     }
-    async getHistory(sessionId) {
+    async getHistory(sessionId, beforeSeq = null, maxMessages = 24) {
         // session.history 返回 { events:[{event:{type,seq,time,data}}], hasMore, projections }
         // 是新建会话也能可靠拿到完整 turn（含 turn/end），用来兜底渲染（WS 对新会话不推事件）
-        try { return await this.call("session.history", { sessionId }); }
-        catch (_e) { return { events: [] }; }
+        // beforeSeq：向上翻页游标（取当前最旧事件的 seq，拉取更早的一批）；maxMessages：单批上限
+        const payload = { sessionId, maxMessages };
+        if (beforeSeq != null) payload.beforeSeq = beforeSeq;
+        try { return await this.call("session.history", payload); }
+        catch (_e) { return { events: [], hasMore: false }; }
+    }
+    async renameSession(sessionId, title) {
+        // DSH 支持 session.rename（VSCode manager.ts:409 同款）。手动编辑会话名。
+        return this.call("session.rename", { sessionId, title });
+    }
+    // Phase F：从排队队列移除一项（运行中追加的消息可撤回）
+    async queueRemove(sessionId, itemId) {
+        return this.call("session.updateQueue", { sessionId, itemId, action: { kind: "remove" } });
+    }
+    async archiveSession(sessionId) {
+        // DSH 支持 workspace.archiveSession（VSCode manager.ts:276）。归档会话。
+        return this.call("workspace.archiveSession", { workspaceId: this.workspace.workspaceId, sessionId });
+    }
+    async forkSession(sessionId) {
+        // DSH 支持 session.fork（VSCode manager.ts:263 同款）。从最后一个完成的轮次复制出新会话。
+        return this.call("session.fork", { sessionId });
+    }
+    // ---- Agent 模式（对齐 VSCode manager.refreshPresets/selectPreset）----
+    async getAgentPresets() {
+        return this.call("agentPreset.list", {});
+    }
+    async selectAgentPreset(sessionId, agentPreset) {
+        return this.call("agentPreset.select", { sessionId, agentPreset });
+    }
+    // 会话级命令执行（VSCode manager.setSessionPermission 同款通道）。
+    // 注意：session.prompt 在本 host 上不分发斜杠命令，会把文本当用户消息漏给模型，
+    // 所以 /permission 这类命令必须走 commands/execute。
+    async executeCommand(agentId, line) {
+        return this.call("commands/execute", { args: { agentId, line } });
+    }
+    // Phase B：/ 技能菜单候选——技能（skill.list 单数）+ 命令（commands/list）。
+    // 与 VSCode manager.ts:419 listSlash 同款契约；任一方失败都用另一方兜底。
+    async listSlash(sessionId) {
+        const out = [];
+        // DSH 若未实现 skill.list / commands/list，RPC 可能挂起（requestUrl 无超时），
+        // 用 3s 竞速兜底，挂起时按“无数据”处理，避免 / 弹窗永远卡在加载态。
+        const TIMEOUT = 3000;
+        const guarded = (p) => Promise.race([
+            p,
+            new Promise((res) => setTimeout(() => res({ __timeout: true }), TIMEOUT)),
+        ]);
+        const [skills, commands] = await Promise.allSettled([
+            guarded(this.call("skill.list", { sessionId })),
+            guarded(this.call("commands/list", { args: { agentId: sessionId } })),
+        ]);
+        if (skills.status === "fulfilled" && !skills.value.__timeout) {
+            const list = (skills.value && skills.value.skills) || (Array.isArray(skills.value) ? skills.value : []);
+            for (const s of list) {
+                if (s && typeof s.name === "string") out.push({ kind: "skill", name: s.name, description: String(s.description || "") });
+            }
+        }
+        if (commands.status === "fulfilled" && !commands.value.__timeout) {
+            const list = Array.isArray(commands.value) ? commands.value : [];
+            for (const c of list) {
+                // 同名技能优先：同名的命令不再重复列出
+                if (c && typeof c.name === "string" && !out.some((o) => o.name === c.name)) {
+                    out.push({ kind: "command", name: c.name, description: String(c.description || "") });
+                }
+            }
+        }
+        return out;
     }
 }
 
@@ -721,6 +961,14 @@ const INJECTED_HEADS = [
     /^The approval policy changed\b/,
     /^This snapshot supersedes\b/,
     /^The available skill catalog changed\b/,
+    // 扩展：技能目录 / 运行时上下文 / 策略的其它常见形态（截图实测泄露项）
+    /^A skill is\b/,
+    /^The following skills\b/,
+    /^Available skills\b/,
+    /^Your (?:available|installed) skills\b/i,
+    /^Tool (?:policy|permissions)\b/,
+    /^File policy\b/,
+    /^Here (?:is|are) (?:your|the) (?:current |available )?(?:context|skills|tools|policy)/i,
 ];
 
 function isSystemContextStart(s) {
@@ -733,9 +981,13 @@ function isSystemContextStart(s) {
 }
 
 function isInjectedParagraphStart(para) {
-    const first = (para.split("\n", 1)[0] || "").trim();
-    if (!first) return false;
+    const trimmed = (para || "").trim();
+    if (!trimmed) return false;
+    const first = trimmed.split("\n", 1)[0];
+    // 段落首行命中（原有逻辑）
     if (INJECTED_HEADS.some((re) => re.test(first))) return true;
+    // 扩展：注入头可能内联在段落中部（DSH 不总是用空行分隔），整段命中即剥除
+    if (INJECTED_HEADS.some((re) => re.test(trimmed))) return true;
     return isSystemContextStart(first);
 }
 
@@ -808,9 +1060,21 @@ function wrapDshUiJson(text) {
             j++;
         }
         if (depth !== 0 || j > n) {
-            // 没闭合，保留原文
-            out += ch;
-            i++;
+            // 未闭合（流式传输中）：若已出现 "items"，视为 dsh-ui 雏形，先包围栏，
+            // 由 postProcessDshUi 显示「⚙️ 组件生成中…」占位，落定后再渲染。
+            const partial = text.slice(i);
+            if (/"items"/.test(partial)) {
+                const before = out.slice(Math.max(0, out.length - 30));
+                if (/```dsh-ui\s*$/i.test(before)) {
+                    out += partial;
+                } else {
+                    out += "```dsh-ui\n" + partial + "\n```";
+                }
+                i = n; // 消费剩余文本
+            } else {
+                out += ch;
+                i++;
+            }
             continue;
         }
         const candidate = text.slice(i, j);
@@ -837,12 +1101,100 @@ function wrapDshUiJson(text) {
     }
     return out;
 }
+
+// ====================================================================
+// dsh-ui spec 容错解析（移植自 VSCode webview/src/components/dshui.tsx）
+// 解决 Bug 2：流式期间 JSON 未闭合 → 原 wrapDshUiJson 平衡括号失败 → 裸 JSON 泄漏。
+// 这里负责「解析失败时的占位」，配合下方 postProcessDshUi。
+// ====================================================================
+// 智能引号 → 直引号；删除 ] / } 前的尾随逗号
+function cheapRepairs(s) {
+    return s.replace(/[\u201c\u201d]/g, '"').replace(/[\u2018\u2019]/g, "'").replace(/,\s*([}\]])/g, "$1");
+}
+// 从 start 扫描一个完整 JSON 值，返回 [endIndex, value] 或 null（尊重字符串/转义/嵌套括号）
+function scanJsonValue(text, start) {
+    let i = start;
+    const n = text.length;
+    while (i < n && /\s/.test(text[i])) i++;
+    if (i >= n) return null;
+    const ch = text[i];
+    if (ch !== "{" && ch !== "[") return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let j = i;
+    while (j < n) {
+        const c = text[j];
+        if (esc) { esc = false; j++; continue; }
+        if (c === "\\") { esc = true; j++; continue; }
+        if (c === '"') { inStr = !inStr; j++; continue; }
+        if (inStr) { j++; continue; }
+        if (c === "{") { depth++; j++; continue; }
+        if (c === "[") { depth++; j++; continue; }
+        if (c === "}") { depth--; j++; if (depth === 0) break; continue; }
+        if (c === "]") { depth--; j++; if (depth === 0) break; continue; }
+        j++;
+    }
+    if (depth !== 0) return null;
+    const slice = text.slice(i, j);
+    try { return [j, JSON.parse(cheapRepairs(slice))]; } catch (_e) { return null; }
+}
+// 根对象提前闭合、后续组件变孤儿值：补回 root.items（DSH 偶发畸形 fences）
+function repairSpec(raw) {
+    const text = raw.trim();
+    if (!text.startsWith("{")) return null;
+    const first = scanJsonValue(text, 0);
+    if (!first) return null;
+    const [end1, v1] = first;
+    const root = v1;
+    if (!root || typeof root !== "object" || !Array.isArray(root.items)) return null;
+    let pos = end1;
+    const orphans = [];
+    let guard = 0;
+    while (guard++ < 50) {
+        while (pos < text.length && /[\s,]/.test(text[pos])) pos++;
+        if (pos >= text.length) break;
+        if (text[pos] === "]" || text[pos] === "}") {
+            if (/^[\]}]+$/.test(text.slice(pos))) break;
+            return null;
+        }
+        const nxt = scanJsonValue(text, pos);
+        if (!nxt) return null;
+        orphans.push(nxt[1]);
+        pos = nxt[0];
+    }
+    if (orphans.length === 0) return null;
+    root.items = [...root.items, ...orphans];
+    return root;
+}
+function parseSpec(raw) {
+    if (typeof raw !== "string") return null;
+    try { const v = JSON.parse(raw); return v && typeof v === "object" ? v : null; } catch (_e) {}
+    try { const v = JSON.parse(cheapRepairs(raw)); return v && typeof v === "object" ? v : null; } catch (_e) {}
+    return repairSpec(cheapRepairs(raw));
+}
+
 // 入口：先剥系统块，再把 JSON 包进 dsh-ui 代码块
 function preprocessAssistantText(text) {
     if (!text) return text;
     let s = stripSystemContext(text);
     s = wrapDshUiJson(s);
     return s;
+}
+
+// 子代理换脸（移植自 VSCode fold.ts:319）：本宿主把子代理委派伪装成普通 tool/call
+// （name ∈ subagent/subagent_fork/ralph/workflow/agent_teams_add_member），没有独立的
+// agent-/subagent- chunk。识别后换成 👥 子代理标签，否则它们会被误标成「🔧 调用工具」而隐形。
+function subagentMeta(name, args) {
+    const n = typeof name === "string" ? name.toLowerCase() : "";
+    if (!["subagent", "subagent_fork", "ralph", "workflow", "agent_teams_add_member"].includes(n)) return null;
+    const a = (args && typeof args === "object") ? args : {};
+    const desc =
+        (typeof a.description === "string" && a.description) ||
+        (typeof a.prompt === "string" ? a.prompt.split("\n", 1)[0].slice(0, 40) : "") ||
+        (typeof a.objective === "string" ? a.objective.split("\n", 1)[0].slice(0, 40) : "") ||
+        "";
+    return "👥 子代理" + (desc ? " · " + desc.slice(0, 50) : "");
 }
 
 /* ====================================================================
@@ -870,6 +1222,26 @@ class DshNativeView extends ItemView {
         this._contentSetByWs = false;
         this._pollStart = 0;
         this._modelFixPromise = null;
+        // Phase 6：附件（@ 文件补全 / 图片粘贴）
+        this._attachments = [];      // [{kind:"file", file:TFile} | {kind:"image", part:{type,image,...}}]
+        this._vaultMdFiles = null;   // 懒缓存：vault 内 markdown 文件列表
+        this._atPopup = null;        // {@ popup DOM 与状态：{el, items, index, isVisible}}
+        // Phase 7：向上翻页状态
+        this._hasMore = false;
+        this._oldestSeq = null;
+        this._loadingOlder = false;
+        // Phase E：plan/todos 投影状态
+        this._planActive = false;
+        this._todos = null;
+        this._todoOpen = false;
+        // Phase A：运行中中断标志
+        this._running = false;
+        // Phase B：/ 技能菜单缓存
+        this._slashCache = null;
+        this._slashErr = null;
+        this._slashPopup = null;
+        // Phase F：排队队列条
+        this._queueItems = null;
     }
 
     getViewType() {
@@ -919,31 +1291,44 @@ class DshNativeView extends ItemView {
 
         // 2) header
         let header;
-        try { header = root.createDiv("dsh-native-header"); }
+        try { header = root.createDiv("dsh-native-header"); this.header = header; }
         catch (e) { return fatal("createDiv header", e); }
-        // 2.1) 顶部条：状态点 + 标题 + 新建 + 历史
+        // 2.1) 顶部条（对齐 VSCode .header）：状态点 + 标题下拉按钮 + 重命名 + spacer + 新建
         let headerTop;
         try { headerTop = header.createDiv("dsh-native-header-top"); }
         catch (e) { return fatal("createDiv headerTop", e); }
         try { this.statusDot = headerTop.createSpan("dsh-status-dot"); }
         catch (e) { return fatal("createSpan statusDot", e); }
+        // 标题按钮：显示当前会话标题 + 下拉箭头，点击展开会话列表（对齐 VSCode title-btn）
         try {
-            const titleEl = headerTop.createSpan("dsh-native-title");
-            titleEl.textContent = "DeepSeek Harness";
-        } catch (e) { return fatal("createSpan title", e); }
+            this.titleBtn = headerTop.createEl("button", { cls: "dsh-title-btn", attr: { title: "点击切换会话；双击重命名" } });
+            this.titleBtn.type = "button";
+            this.titleText = this.titleBtn.createSpan("dsh-title-text");
+            this.titleText.textContent = "—";
+            this.titleChev = this.titleBtn.createSpan("dsh-chev");
+            this.titleChev.textContent = "⌄";
+            this.titleBtn.addEventListener("click", () => this.toggleSessionList());
+            this.titleBtn.addEventListener("dblclick", (e) => { e.preventDefault(); this.openRenameBar(); });
+        } catch (e) { return fatal("createEl titleBtn", e); }
+        // 重命名图标（对齐 VSCode icon-btn mini ✎）
         try {
-            this.newBtn = headerTop.createEl("button", { cls: "dsh-btn dsh-icon-btn", attr: { title: "新建会话" } });
+            this.renameIcon = headerTop.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "重命名会话" } });
+            this.renameIcon.textContent = "✎";
+            this.renameIcon.addEventListener("click", () => this.openRenameBar());
+        } catch (e) { return fatal("createEl renameIcon", e); }
+        // Agent 模式选择（对齐 VSCode PresetPicker：发消息前可切换，发出后锁定 🔒）
+        try { this.presetSlot = headerTop.createSpan("dsh-preset-slot"); }
+        catch (e) { return fatal("createSpan presetSlot", e); }
+        try { this.headerSpacer = headerTop.createDiv("dsh-spacer"); }
+        catch (e) { return fatal("createDiv spacer", e); }
+        try {
+            this.newBtn = headerTop.createEl("button", { cls: "dsh-icon-btn", attr: { title: "新建会话" } });
             this.newBtn.textContent = "＋";
             this.newBtn.addEventListener("click", () => this.newSession());
         } catch (e) { return fatal("createEl newBtn", e); }
-        try {
-            this.historyBtn = headerTop.createEl("button", { cls: "dsh-btn dsh-icon-btn", attr: { title: "历史会话" } });
-            this.historyBtn.textContent = "☰";
-            this.historyBtn.addEventListener("click", () => this.openHistory());
-        } catch (e) { return fatal("createEl historyBtn", e); }
-        // 2.2) 多标签会话栏（Claudian 风格）
-        try { this.tabBar = header.createDiv("dsh-tabbar"); }
-        catch (e) { return fatal("createDiv tabBar", e); }
+        // 2.2) 会话列表下拉（对齐 VSCode .session-list，替换原多标签栏）
+        try { this.sessionList = header.createDiv("dsh-session-list"); this.sessionList.style.display = "none"; }
+        catch (e) { return fatal("createDiv sessionList", e); }
 
         // 3) messages
         try { this.messagesEl = root.createDiv("dsh-native-messages"); }
@@ -975,6 +1360,16 @@ class DshNativeView extends ItemView {
                 }
             });
         } catch (e) { /* 委托失败不影响主流程 */ }
+        // 3.2) 向上翻页：滚到顶部且还有更早历史时，拉取前一批（beforeSeq 游标）
+        try {
+            this.messagesEl.addEventListener("scroll", () => {
+                if (this._loadingOlder) return;
+                if (!this.messagesEl) return;
+                if (this.messagesEl.scrollTop < 48 && this._hasMore && this._oldestSeq != null && this.sessionId) {
+                    this.loadOlder();
+                }
+            });
+        } catch (e) { /* 非致命 */ }
         // status line
         try { this.statusLine = root.createDiv("dsh-native-statusline"); }
         catch (e) { return fatal("createDiv statusline", e); }
@@ -982,23 +1377,18 @@ class DshNativeView extends ItemView {
         // 3.5) controls bar（模式 / 模型 / 权限 — 对齐 VSCode DSH 底部下拉）
         try {
             this.controlsBar = root.createDiv("dsh-native-controls");
-            // 模式（queue / steer 段控件）
-            this.modeLabel = this.controlsBar.createSpan("dsh-ctl-label");
-            this.modeLabel.textContent = "模式";
-            this.modeToggle = this.controlsBar.createDiv("dsh-mode-toggle");
-            this.modeBtnQueue = this.modeToggle.createEl("button", { cls: "dsh-mode-btn", attr: { title: "queue — 排队等当前 turn 结束" } });
-            this.modeBtnQueue.textContent = "队列";
-            this.modeBtnSteer = this.modeToggle.createEl("button", { cls: "dsh-mode-btn", attr: { title: "steer — 立即打断/引导当前 turn" } });
-            this.modeBtnSteer.textContent = "引导";
+            // 模式（queue / steer）：单按钮切换，无前缀标签（对齐 VSCode composer-actions 的 chip-btn 切换）
+            this.modeBtn = this.controlsBar.createEl("button", {
+                cls: "dsh-chip-btn",
+                attr: { title: "点击切换：队列（等当前轮结束）/ 引导（运行中插队）" },
+            });
+            this.modeBtn.type = "button";
             const curMode = (this.plugin && this.plugin.settings && this.plugin.settings.mode) || "queue";
             this._applyModeUi(curMode);
-            this.modeBtnQueue.addEventListener("click", () => this.setMode("queue"));
-            this.modeBtnSteer.addEventListener("click", () => this.setMode("steer"));
+            this.modeBtn.addEventListener("click", () => this.setMode((this.plugin.settings.mode || "queue") === "queue" ? "steer" : "queue"));
 
-            // 提供方/模型（session.models RPC 驱动）
-            this.modelLabel = this.controlsBar.createSpan("dsh-ctl-label");
-            this.modelLabel.textContent = "提供方/模型";
-            this.modelSelect = this.controlsBar.createEl("select", { cls: "dsh-model-select" });
+            // 提供方/模型（session.models RPC 驱动）：chip-btn 下拉，当前值直接显示 provider/model，无前缀（对齐 VSCode）
+            this.modelSelect = this.controlsBar.createEl("select", { cls: "dsh-chip-btn dsh-model-select" });
             const phOpt = this.modelSelect.createEl("option", { value: "" });
             phOpt.textContent = "加载中…";
             this.modelSelect.disabled = true;
@@ -1012,36 +1402,127 @@ class DshNativeView extends ItemView {
                 this.switchModel(provider, model, effort);
             });
 
-            // 权限（settings.describe 静态读 defaultPreset + projection 实时更新；下拉切换走 settings.mutate）
-            this.permLabel = this.controlsBar.createSpan("dsh-ctl-label");
-            this.permLabel.textContent = "权限";
-            this.permSelect = this.controlsBar.createEl("select", { cls: "dsh-perm-select" });
+            // 思考强度（对齐 VSCode EffortPicker）：仅当前模型支持 reasoning 时显示
+            this.effortSelect = this.controlsBar.createEl("select", { cls: "dsh-chip-btn dsh-effort-select" });
+            this.effortSelect.style.display = "none";
+            this.effortSelect.addEventListener("change", () => {
+                const v = this.effortSelect.value;
+                if (!v) return;
+                const cur = this._currentModels && this._currentModels.current;
+                if (cur) this.switchModel(cur.provider, cur.model, v);
+            });
+
+            // 权限（对齐 VSCode：会话级预设，经 /permission 命令立即生效；选项初值来自 settings.describe，实时值由投影更新）
+            // chip-btn 下拉，无前缀（对齐 VSCode）
+            this.permSelect = this.controlsBar.createEl("select", { cls: "dsh-chip-btn dsh-perm-select" });
             const ph = this.permSelect.createEl("option", { value: "" });
             ph.textContent = "加载中…";
             this.permSelect.disabled = true;
             this.permSelect.addEventListener("change", () => this.switchPermission());
             // 兼容旧字段 permValue（占位符，给 setSession 用）
             this.permValue = this.permSelect;
+            // token 用量行（对齐 VSCode .composer-meta）：控制条下方右对齐小字
+            try {
+                this.composerMeta = root.createDiv("dsh-composer-meta");
+                this.composerMeta.style.display = "none";
+            } catch (e) { /* 非致命 */ }
         }
         catch (e) { return fatal("createDiv controls", e); }
 
         // 4) input
         let inputBar;
+        // 4.5) 实时活动指示条（composer 上方）：子代理/工具执行中可见（Bug 4 次要增强）
+        // 内含「停止」按钮：运行中可中断当前 turn（Phase A）
+        try {
+            const liveBar = root.createDiv("dsh-native-livebar");
+            liveBar.style.display = "none";
+            this.liveBar = liveBar;
+            liveBar.createSpan("dsh-spinner"); // 对齐 VSCode live-bar 的旋转指示
+            this.liveBarLabel = liveBar.createSpan("dsh-livebar-label");
+            this.stopBtn = liveBar.createEl("button", {
+                cls: "dsh-native-stopbtn",
+                text: "停止",
+                attr: { title: "中断当前生成 (Esc)", "aria-label": "停止" },
+            });
+            this.stopBtn.type = "button";
+            this.stopBtn.addEventListener("click", (e) => { e.preventDefault(); this.requestCancel(); });
+        }
+        catch (e) { /* 非致命 */ }
+        // 4.6) Plan 模式横幅 + Todo 进度条（Phase E，由 session/projection 的 plan/todos 驱动）
+        try {
+            this.planStrip = root.createDiv("dsh-plan-strip");
+            this.planStrip.style.display = "none";
+        }
+        catch (e) { /* 非致命 */ }
+        // 4.7) 排队队列条（Phase F，由 session/queue 帧驱动，展示运行中追加的消息）
+        try {
+            this.queueStrip = root.createDiv("dsh-queue-strip");
+            this.queueStrip.style.display = "none";
+        }
+        catch (e) { /* 非致命 */ }
         try { inputBar = root.createDiv("dsh-native-inputbar"); }
         catch (e) { return fatal("createDiv inputbar", e); }
+        this.inputBar = inputBar; // Phase B/@：弹窗锚点，必须挂到 this，否则 showSlashPopup/showAtPopup 因 this.inputBar 为 undefined 直接 return
+        // Phase 6：附件 chip 容器（位于 textarea 上方）
+        try { this.attachmentsEl = inputBar.createDiv("dsh-native-attachments"); this.attachmentsEl.style.display = "none"; }
+        catch (e) { /* 非致命 */ }
+        // Phase D：引用选区/笔记按钮（等价于 Alt+K 命令），加入输入框作为内容块
+        try {
+            this.refBtn = inputBar.createEl("button", {
+                cls: "dsh-native-refbtn",
+                text: "📎 引用",
+                attr: { title: "引用当前选区/笔记到输入框（可绑定 Alt+K）", "aria-label": "引用" },
+            });
+            this.refBtn.type = "button";
+            this.refBtn.addEventListener("click", (e) => { e.preventDefault(); this.attachActiveContext(); });
+        }
+        catch (e) { /* 非致命 */ }
         try {
             this.inputEl = inputBar.createEl("textarea", {
                 cls: "dsh-native-input",
-                placeholder: "给 DSH 发消息…（Enter 发送，Shift+Enter 换行）",
+                placeholder: "给 DSH 发消息…（Enter 发送，Shift+Enter 换行，输入 @ 引用 vault 文件，粘贴图片作为附件）",
             });
             this.inputEl.addEventListener("keydown", (e) => {
+                // @ 弹窗可见时，方向键/Enter/Esc 由弹窗接管；否则 Enter 发送
+                if (this._atPopup && this._atPopup.isVisible && this.handleAtKeydown(e)) return;
+                // Phase B：/ 技能菜单可见时，方向键/Enter/Esc 由弹窗接管
+                if (this._slashPopup && this._slashPopup.isVisible && this.handleSlashKeydown(e)) return;
+                // Phase A：运行中按 Esc 中断当前 turn（DSH 走 session.cancel）
+                if (e.key === "Escape" && this._running) {
+                    e.preventDefault();
+                    this.requestCancel();
+                    return;
+                }
                 if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     this.send();
                 }
             });
+            this.inputEl.addEventListener("input", () => { this.updateAtTrigger(); this.updateSlashTrigger(); });
+            this.inputEl.addEventListener("paste", (e) => this.handlePaste(e));
+            this.inputEl.addEventListener("blur", () => {
+                // 延迟关闭，确保 mousedown 选中文件先生效
+                setTimeout(() => {
+                    if (this._atPopup && this._atPopup.isVisible) this.hideAtPopup();
+                    if (this._slashPopup && this._slashPopup.isVisible) this.hideSlashPopup();
+                }, 160);
+            });
+            this.inputEl.addEventListener("input", () => this.updateSendState());
         } catch (e) { return fatal("createEl textarea", e); }
-        // 注：底部输入框不画发送按钮——通用惯例 Enter 发送 / Shift+Enter 换行（keydown 已处理）
+        // 发送按钮：浮于输入框内右下角（点击或 Enter 均触发 send）
+        try {
+            this.sendBtn = inputBar.createEl("button", {
+                cls: "dsh-native-send",
+                attr: { title: "发送 (Enter)", "aria-label": "发送" },
+            });
+            this.sendBtn.textContent = "➤"; // ▶ 发送图标
+            this.sendBtn.type = "button";
+            this.sendBtn.addEventListener("click", (e) => {
+                e.preventDefault();
+                this.send();
+            });
+            this.updateSendState();
+        } catch (e) { /* 非致命：按钮缺失不影响 Enter 发送 */ }
 
         // 5) 启动后台连接（boot 内部已自捕获异常并显式浮出）
         this.boot().catch((e) => {
@@ -1092,6 +1573,10 @@ class DshNativeView extends ItemView {
             await this.loadSessions();
             // 全局默认权限（DSH 不分会话：permission.defaultPreset 写一次即可）
             await this.loadPermissions();
+            // Agent 模式目录（对齐 VSCode：agentPreset.list，头部选择器用）
+            try { this._presets = await this.api.getAgentPresets(); }
+            catch (_e) { this._presets = { presets: [] }; }
+            this.renderPresetPicker();
             this.hideOverlay();
             this.setStatus("online");
             this.connectWs();
@@ -1148,38 +1633,159 @@ class DshNativeView extends ItemView {
             this.openTabs = [s.sessionId];
             this.setSession(s.sessionId);
         }
-        this.renderTabs();
+        this.renderSessionList();
+        this.updateTitleBtn();
     }
 
     _tabTitle(s) {
+        // 手动重命名优先（持久化覆盖，跨重启保留）；其次 DSH 标题；最后兜底
+        if (s && s.sessionId && this.plugin && this.plugin.settings && this.plugin.settings.manualTitles) {
+            const mt = this.plugin.settings.manualTitles[s.sessionId];
+            if (mt) return mt;
+        }
         if (s && s.title) return s.title;
         if (s && s.sessionId) return "未命名 · " + s.sessionId.slice(0, 12);
         return "未命名";
     }
 
-    renderTabs() {
-        if (!this.tabBar) return;
-        this.tabBar.empty();
-        const open = this.openTabs || [];
-        for (const id of open) {
-            const s = this.sessions.find((x) => x.sessionId === id);
-            if (!s) continue;
-            const tab = this.tabBar.createEl("div", {
-                cls: "dsh-tab" + (id === this.sessionId ? " is-active" : ""),
+    renderSessionList() {
+        if (!this.sessionList) return;
+        this.sessionList.empty();
+        // 对齐 VSCode .session-list：列出全部可见会话（而非仅本地打开的标签）
+        for (const s of this.sessions) {
+            const id = s.sessionId;
+            const row = this.sessionList.createEl("div", {
+                cls: "dsh-session-row" + (id === this.sessionId ? " is-current" : ""),
             });
-            const label = tab.createSpan("dsh-tab-label");
-            label.textContent = this._tabTitle(s);
-            label.title = s.sessionId;
-            if (open.length > 1) {
-                const close = tab.createEl("span", { cls: "dsh-tab-close", attr: { title: "关闭标签" } });
-                close.textContent = "×";
-                close.addEventListener("click", (e) => {
-                    e.stopPropagation();
-                    this.closeTab(id);
-                });
-            }
-            tab.addEventListener("click", () => this.openSessionAsTab(id));
+            const dot = row.createSpan("dsh-dot" + (s.running ? " dsh-dot-running" : " dsh-dot-idle"));
+            const title = row.createSpan("dsh-session-title");
+            title.textContent = this._tabTitle(s);
+            const ren = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "重命名" } });
+            ren.textContent = "✎";
+            ren.addEventListener("click", (e) => { e.stopPropagation(); this.openRenameBar(id); });
+            const forkBtn = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "分叉会话（从最后一个完成的轮次复制出新会话）" } });
+            forkBtn.textContent = "⑂";
+            forkBtn.addEventListener("click", (e) => { e.stopPropagation(); this.forkSessionRow(id); });
+            const arc = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "归档（从列表隐藏，可在 DSH 网页版找回）" } });
+            arc.textContent = "🗄";
+            arc.addEventListener("click", (e) => { e.stopPropagation(); this.archiveSessionRow(id); });
+            row.addEventListener("click", () => { this.toggleSessionList(false); this.openSessionAsTab(id); });
         }
+    }
+
+    // 分叉会话（对齐 VSCode fork-session）
+    async forkSessionRow(id) {
+        try {
+            const child = await this.api.forkSession(id);
+            await this.refreshSessions();
+            this.toggleSessionList(false);
+            this.openSessionAsTab(child.sessionId);
+            new Notice("已分叉出新会话");
+        } catch (e) {
+            new Notice("分叉失败：" + (e && e.message ? e.message : String(e)));
+        }
+    }
+
+    // 归档会话（对齐 VSCode archive-session）：从列表隐藏；归档当前会话则顺延切换
+    async archiveSessionRow(id) {
+        try {
+            await this.api.archiveSession(id);
+        } catch (e) {
+            new Notice("归档失败：" + (e && e.message ? e.message : String(e)));
+            return;
+        }
+        this.openTabs = (this.openTabs || []).filter((x) => x !== id);
+        if (id === this.sessionId) {
+            const next = this.sessions.find((x) => x.sessionId !== id);
+            if (next && next.sessionId) {
+                this.setSession(next.sessionId);
+            } else {
+                try {
+                    const s = await this.api.createSession(this.workspace.workspaceId);
+                    this.sessions = [{ sessionId: s.sessionId, title: "新会话", blank: true }];
+                    this.openTabs = [s.sessionId];
+                    this.setSession(s.sessionId);
+                } catch (_e) { /* 极端情况：保留当前态 */ }
+            }
+        }
+        await this.refreshSessions();
+        new Notice("已归档会话（可在 DSH 网页版找回）");
+    }
+
+    // 轻量刷新：重拉列表但不打断当前会话（分叉/归档/外部变更后用）
+    async refreshSessions() {
+        try {
+            const listed = await this.api.listSessions(this.workspace.workspaceId);
+            const curEntry = this.sessions.find((x) => x.sessionId === this.sessionId);
+            this.sessions = listed;
+            if (curEntry && !listed.some((x) => x.sessionId === curEntry.sessionId)) this.sessions.unshift(curEntry);
+        } catch (_e) { /* 刷新失败保留现有列表 */ }
+        this.renderSessionList();
+        this.updateTitleBtn();
+        this.renderPresetPicker();
+    }
+
+    toggleSessionList(force) {
+        if (!this.sessionList) return;
+        const show = force === undefined ? (this.sessionList.style.display === "none") : force;
+        if (show) { this.renderSessionList(); this.sessionList.style.display = "block"; }
+        else this.sessionList.style.display = "none";
+    }
+
+    updateTitleBtn() {
+        if (!this.titleText) return;
+        const s = this.sessions.find((x) => x.sessionId === this.sessionId);
+        this.titleText.textContent = s ? this._tabTitle(s) : (this.sessionId ? "未命名" : "—");
+    }
+
+    // 重命名会话（对齐 VSCode .rename-bar：标题按钮 ✎ / 双击标题 打开输入框，Enter 保存）
+    openRenameBar(id) {
+        const sid = id || this.sessionId;
+        if (!sid) return;
+        const s = this.sessions.find((x) => x.sessionId === sid);
+        if (!s) return;
+        this.closeRenameBar();
+        if (!this.header) return;
+        const bar = this.header.createDiv("dsh-rename-bar");
+        this._renameBar = bar;
+        const cur = this._tabTitle(s);
+        const input = bar.createEl("input", { cls: "dsh-rename-input", type: "text" });
+        input.placeholder = "会话标题…";
+        input.value = (cur === "新会话" || cur === "未命名" || cur === "—") ? "" : cur;
+        const save = bar.createEl("button", { cls: "dsh-btn mod-cta", text: "保存" });
+        const cancel = bar.createEl("button", { cls: "dsh-btn", text: "取消" });
+        const commit = async () => {
+            const v = input.value.trim();
+            if (v && v !== cur) {
+                try {
+                    await this.api.renameSession(sid, v);
+                    s.title = v;
+                    // 持久化本地覆盖：无论 DSH 是否回写 title 投影，重启后都按手动名显示
+                    if (this.plugin && this.plugin.settings) {
+                        this.plugin.settings.manualTitles = this.plugin.settings.manualTitles || {};
+                        this.plugin.settings.manualTitles[sid] = v;
+                        this.plugin.saveSettings();
+                    }
+                    new Notice("已重命名会话");
+                    this.updateTitleBtn();
+                    this.renderSessionList();
+                } catch (e) {
+                    new Notice("重命名失败：" + (e && e.message ? e.message : String(e)));
+                }
+            }
+            this.closeRenameBar();
+        };
+        save.addEventListener("click", () => { commit(); });
+        cancel.addEventListener("click", () => this.closeRenameBar());
+        input.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") { e.preventDefault(); commit(); }
+            else if (e.key === "Escape") { e.preventDefault(); this.closeRenameBar(); }
+        });
+        input.focus();
+        input.select();
+    }
+    closeRenameBar() {
+        if (this._renameBar) { this._renameBar.remove(); this._renameBar = null; }
     }
 
     openSessionAsTab(id) {
@@ -1189,21 +1795,10 @@ class DshNativeView extends ItemView {
             // 超过 6 个标签回收最旧（最左）
             while (this.openTabs.length > 6) this.openTabs.shift();
         }
-        if (id === this.sessionId) { this.renderTabs(); return; }
+        // 已是当前会话：不重建 DOM（否则会销毁正在双击的 label，导致 dblclick 收不到）
+        if (id === this.sessionId) return;
         this.setSession(id);
-        this.renderTabs();
-    }
-
-    closeTab(id) {
-        if (!this.openTabs || this.openTabs.length <= 1) return;
-        const idx = this.openTabs.indexOf(id);
-        if (idx < 0) return;
-        this.openTabs.splice(idx, 1);
-        if (id === this.sessionId) {
-            const next = this.openTabs[Math.max(0, idx - 1)];
-            this.setSession(next);
-        }
-        this.renderTabs();
+        this.renderSessionList();
     }
 
     setSession(id) {
@@ -1211,12 +1806,25 @@ class DshNativeView extends ItemView {
         this.clearConversation();
         // 清空待处理审批
         this.pending.clear();
+        // Phase B：切换会话重置 / 技能菜单缓存（skill.list 按会话返回）
+        this._slashCache = null;
+        this._slashErr = null;
+        if (this._slashPopup) this.hideSlashPopup();
+        // Phase E：切换会话重置 plan/todos 投影状态，避免上一个会话的横幅残留
+        this._planActive = false;
+        this._todos = null;
+        this._todoOpen = false;
+        this.renderPlanStrip();
+        // Phase F：切换会话清空排队条
+        if (this.queueStrip) this.queueStrip.style.display = "none";
         this.setStatus("online");
         // 会话切换后重新拉模型目录 + 权限（投影 + settings.describe 双通道）
         this.loadModels();
         this.loadPermissions();
         // 渲染该会话的历史消息（对齐 VSCode/Claudian：切到会话即看到完整对话）
         this.loadHistory(id);
+        this.updateTitleBtn();
+        this.renderPresetPicker();
     }
 
     async switchSession(id) {
@@ -1232,16 +1840,16 @@ class DshNativeView extends ItemView {
         const s = await this.api.createSession(this.workspace.workspaceId);
         this.sessions.unshift({ sessionId: s.sessionId, title: "新会话", blank: true });
         this.openSessionAsTab(s.sessionId);
+        this.updateTitleBtn();
     }
 
     /* ---------- 模式 / 模型 / 权限 ---------- */
     _applyModeUi(mode) {
-        if (!this.modeBtnQueue || !this.modeBtnSteer) return;
-        const isQueue = mode === "queue";
-        this.modeBtnQueue.classList.toggle("is-active", isQueue);
-        this.modeBtnSteer.classList.toggle("is-active", !isQueue);
-        this.modeBtnQueue.setAttribute("aria-pressed", isQueue ? "true" : "false");
-        this.modeBtnSteer.setAttribute("aria-pressed", !isQueue ? "true" : "false");
+        if (!this.modeBtn) return;
+        const isQueue = mode !== "steer";
+        this.modeBtn.textContent = isQueue ? "排队" : "引导"; // 文案与已装 VSCode 0.5.1 完全一致（排队/引导）
+        this.modeBtn.classList.toggle("is-on", !isQueue); // steer = 激活态（对齐 VSCode）
+        this.modeBtn.setAttribute("aria-pressed", (!isQueue).toString());
         // 引导（steer）模式：输入框青色边，作为「计划待确认」的可视化信号（对齐 Claudian）
         if (this.inputEl) this.inputEl.classList.toggle("is-steer", !isQueue);
     }
@@ -1253,12 +1861,61 @@ class DshNativeView extends ItemView {
             try { await this.plugin.saveSettings(); } catch (_e) {}
         }
     }
+    /* ---------- Agent 模式（agentPreset，对齐 VSCode PresetPicker） ---------- */
+    renderPresetPicker() {
+        if (!this.presetSlot) return;
+        this.presetSlot.empty();
+        const list = (this._presets && Array.isArray(this._presets.presets)) ? this._presets.presets : [];
+        if (list.length === 0) return; // 无目录则整个部件不出现（同 VSCode）
+        const s = this.sessions.find((x) => x.sessionId === this.sessionId);
+        const active = (s && s.agentPreset) || (list.find((p) => p.isDefault) || {}).id || "标准";
+        const activeLabel = ((list.find((p) => p.id === active) || {}).name) || active;
+        // DSH 在首轮后锁定组装（agent-preset-locked）：非空白会话只展示 🔒 徽标
+        if (!s || !s.blank) {
+            const chip = this.presetSlot.createSpan("dsh-chip-btn is-locked");
+            chip.textContent = "🔒 " + activeLabel;
+            chip.setAttribute("title", "会话已发过消息，模式已固定");
+            return;
+        }
+        const sel = this.presetSlot.createEl("select", { cls: "dsh-chip-btn dsh-preset-select" });
+        sel.setAttribute("title", "Agent 模式（发消息前可切换，发出后固定）");
+        for (const p of list) {
+            const o = sel.createEl("option", { value: p.id });
+            o.textContent = (p.name || p.id)
+                + (p.isDefault ? "（默认）" : "")
+                + (p.broken ? "（不可用：" + String(p.broken).slice(0, 30) + "）" : "");
+            if (p.broken) o.disabled = true;
+            if (p.id === active) o.selected = true;
+        }
+        sel.addEventListener("change", () => {
+            const v = sel.value;
+            if (!v || v === active) return;
+            this.applyAgentPreset(v);
+        });
+    }
+    async applyAgentPreset(presetId) {
+        if (!this.sessionId) return;
+        try {
+            await this.api.selectAgentPreset(this.sessionId, presetId);
+            const s = this.sessions.find((x) => x.sessionId === this.sessionId);
+            if (s) s.agentPreset = presetId;
+            new Notice("已切换 Agent 模式：" + presetId);
+            this.loadModels(); // 模型目录可能随 preset 变化
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            if (msg.includes("agent-preset-locked")) new Notice("会话已发过消息，模式已固定，不能切换（新建会话可选）");
+            else new Notice("切换模式失败：" + msg);
+        }
+        this.renderPresetPicker();
+    }
+
     async loadModels() {
         if (!this.sessionId || !this.modelSelect) return;
         try {
             // DSH 真实结构：{ current:{provider,model,reasoningEffort?}, groups:[{id, name, models:[{id, name, description?, reasoning?: {efforts, defaultEffort}}]}] }
             // 不是扁平的 models:[]，所以必须从 groups[].models[] 平铺出来。
             const r = await this.api.getModels(this.sessionId);
+            this._currentModels = r;
             const groups = Array.isArray(r && r.groups) ? r.groups : [];
             const current = r && r.current;
 
@@ -1287,11 +1944,9 @@ class DshNativeView extends ItemView {
                     provider = provider || g.id || "";
                     if (!provider || !model) continue;
                     const effort = m.reasoning && m.reasoning.defaultEffort ? m.reasoning.defaultEffort : "";
-                    // 选项文本带「提供方 / 模型」，收起下拉也能看到当前用的是哪家提供方（不同项目用不同提供方时尤其重要）
+                    // 选项文本 = 提供方 / 模型（对齐 VSCode chip 显示 provider/model，无冗余描述）
                     const provName = g.name || g.id || provider;
-                    const labelParts = [provName + " / " + (m.name || model)];
-                    if (m.description) labelParts.push(m.description);
-                    const label = labelParts.join(" — ");
+                    const label = provName + "/" + (m.name || model); // 与 VSCode 同款「提供方/模型」无空格
                     const opt = og.createEl("option", {
                         value: provider + "::" + model + (effort ? "::" + effort : "")
                     });
@@ -1332,18 +1987,50 @@ class DshNativeView extends ItemView {
             } else {
                 this.modelSelect.disabled = false;
             }
+            // 思考强度下拉跟随当前模型（对齐 VSCode EffortPicker）
+            this.renderEfforts(current, groups);
         } catch (_e) {
             this.modelSelect.empty();
             const o = this.modelSelect.createEl("option", { value: "" });
             o.textContent = "模型加载失败";
             this.modelSelect.disabled = true;
+            if (this.effortSelect) this.effortSelect.style.display = "none";
         }
+    }
+    renderEfforts(current, groups) {
+        if (!this.effortSelect) return;
+        let efforts = [];
+        if (current) {
+            // 与 VSCode 同款：按 provider 先匹配（同一 model id 可能出现在多个 provider 下，
+            // 别处的同名模型可能带 reasoning 而当前的没有，取错会让切换被服务端拒绝）
+            const own = (groups || []).find((g) => g.id === current.provider || g.provider === current.provider);
+            const hit = own && Array.isArray(own.models)
+                ? own.models.find((x) => (x.id || "").toLowerCase() === (current.model || "").toLowerCase())
+                : null;
+            efforts = hit && hit.reasoning && Array.isArray(hit.reasoning.efforts) ? hit.reasoning.efforts : [];
+        }
+        this.effortSelect.empty();
+        if (!current || efforts.length === 0) { this.effortSelect.style.display = "none"; return; }
+        if (!current.reasoningEffort) {
+            const ph = this.effortSelect.createEl("option", { value: "" });
+            ph.textContent = "思考强度…";
+        }
+        for (const ef of efforts) {
+            const o = this.effortSelect.createEl("option", { value: ef.id });
+            o.textContent = ef.name || ef.id;
+            if (current.reasoningEffort && ef.id === current.reasoningEffort) o.selected = true;
+        }
+        this.effortSelect.title = "思考强度";
+        this.effortSelect.disabled = false;
+        this.effortSelect.style.display = "";
     }
     async switchModel(provider, model, effort) {
         if (!this.sessionId) return;
         try {
             await this.api.selectModel(this.sessionId, provider, model, effort);
             new Notice("已切换模型：" + provider + "/" + model);
+            // 重拉目录：不同模型的 reasoning.efforts 不同，思考强度下拉要跟随
+            await this.loadModels();
         } catch (e) {
             new Notice("切换模型失败：" + (e && e.message ? e.message : String(e)));
             // 失败后回滚下拉（重拉）
@@ -1380,10 +2067,17 @@ class DshNativeView extends ItemView {
     }
     async switchPermission() {
         const target = this.permSelect.value;
-        if (!target) return;
+        if (!target || !this.sessionId) return;
         try {
-            await this.api.setPermissionPreset(target, this._permRevision);
-            new Notice("已切换权限预设：" + target);
+            // 对齐 VSCode：会话级权限经 /permission 命令立即生效（settings.defaultPreset 只影响未来会话，
+            // 旧实现写全局值却显示会话值，语义是拧的）
+            const r = await this.api.executeCommand(this.sessionId, "/permission " + target);
+            if (!r) { new Notice("当前主机没有 /permission 命令"); return; }
+            if (r.result && r.result.kind === "error") {
+                new Notice("权限切换被拒绝：" + (r.result.text || ""));
+                return;
+            }
+            new Notice("已切换权限预设（当前会话）：" + target);
             // 写完后 DSH 会推 projection 更新当前值；不主动 reload，避免抢投影
         } catch (e) {
             new Notice("切换权限失败：" + (e && e.message ? e.message : String(e)));
@@ -1405,6 +2099,8 @@ class DshNativeView extends ItemView {
         // 重置工具/子代理活动跟踪（Bug 4）
         this._activities = new Map();
         this._activityHolder = null;
+        // 切换会话清空已发送用户文本去重集合，避免跨会话泄漏导致历史消息被误删
+        this._userTextsSent = new Set();
     }
 
     setStatus(state) {
@@ -1412,23 +2108,404 @@ class DshNativeView extends ItemView {
         this.statusDot.className = "dsh-status-dot " + (state === "online" ? "online" : state === "connecting" ? "connecting" : "offline");
     }
 
+    /* ---------- Phase 6：附件 + @ 文件补全 + 图片粘贴 ---------- */
+    // 发送按钮可用态：有文本或附件才启用
+    updateSendState() {
+        if (!this.sendBtn) return;
+        const hasText = this.inputEl && this.inputEl.value.trim().length > 0;
+        const hasAtt = this._attachments && this._attachments.length > 0;
+        const enabled = !!(hasText || hasAtt);
+        this.sendBtn.disabled = !enabled;
+        this.sendBtn.classList.toggle("is-disabled", !enabled);
+    }
+
+    renderAttachments() {
+        const box = this.attachmentsEl;
+        if (!box) return;
+        box.empty();
+        const atts = this._attachments || [];
+        if (!atts.length) { box.style.display = "none"; this.updateSendState(); return; }
+        box.style.display = "flex";
+        for (let i = 0; i < atts.length; i++) {
+            const a = atts[i];
+            const chip = box.createDiv("dsh-atchip");
+            const label = chip.createSpan("dsh-atchip-label");
+            label.textContent = a.kind === "file"
+                ? ("📄 " + a.file.name)
+                : a.kind === "image"
+                    ? ("🖼️ " + (a.part.name || "图片"))
+                    : ("📝 " + (a.path ? a.path + " 选区" : "选区"));
+            const x = chip.createSpan("dsh-atchip-x");
+            x.textContent = "×";
+            x.addEventListener("click", () => {
+                this._attachments.splice(i, 1);
+                this.renderAttachments();
+            });
+        }
+        this.updateSendState();
+    }
+
+    addAttachmentFile(file) {
+        if (!this._attachments) this._attachments = [];
+        if (this._attachments.some((a) => a.kind === "file" && a.file.path === file.path)) return; // 去重
+        this._attachments.push({ kind: "file", file });
+        this.renderAttachments();
+    }
+
+    addAttachmentImage(part) {
+        if (!this._attachments) this._attachments = [];
+        this._attachments.push({ kind: "image", part });
+        this.renderAttachments();
+    }
+
+    // Phase D：把 Obsidian 活动编辑器选区作为「真实内容块」加入输入框
+    // （区别于 @ 假引用：选区文本会被实际嵌入 prompt；无选区时退回整文件 file part）
+    addAttachmentSelection(text, path) {
+        if (!this._attachments) this._attachments = [];
+        const t = (text || "").trim();
+        if (!t) return;
+        if (this._attachments.some((a) => a.kind === "selection" && a.text === t)) return; // 去重
+        this._attachments.push({ kind: "selection", text: t, path: path || null });
+        this.renderAttachments();
+    }
+
+    // Phase D：Alt+K 等价操作——抓取活动编辑器选区或整文件，作为内容块加入输入框
+    // 用户可继续输入，随下一条消息一起发送（与 @/图片 同模型）
+    attachActiveContext() {
+        const ws = this.app && this.app.workspace;
+        if (!ws) return;
+        const file = ws.getActiveFile();
+        const editor = ws.activeEditor;
+        const sel = (editor && editor.getSelection && editor.getSelection && editor.getSelection()) || "";
+        if (sel.trim()) {
+            this.addAttachmentSelection(sel, file ? file.path : null);
+            new Notice("已加入选区作为内容块");
+        } else if (file) {
+            this.addAttachmentFile(file);
+            new Notice("已加入文件：" + file.path);
+        } else {
+            new Notice("没有打开的笔记或选区");
+            return;
+        }
+        if (this.inputEl) this.inputEl.focus();
+    }
+
+    buildPromptParts(text, attachments) {
+        const parts = [{ type: "text", text: text || "" }];
+        const vaultRoot = (this.plugin && this.plugin.getVaultPath && this.plugin.getVaultPath()) || "";
+        for (const a of (attachments || [])) {
+            if (a.kind === "file") {
+                const f = a.file;
+                const abs = vaultRoot ? (vaultRoot.replace(/\/$/, "") + "/" + f.path) : f.path;
+                parts.push({ type: "file", path: abs, rel: f.path });
+            } else if (a.kind === "image") {
+                parts.push(a.part);
+            } else if (a.kind === "selection") {
+                // 选区文本作为真实内容块嵌入（带来源标注，便于 DSH 区分上下文与指令）
+                const label = a.path ? `引用 ${a.path} 选区` : "引用选区";
+                parts.push({ type: "text", text: `\n\n--- ${label} ---\n${a.text}\n--- 选区结束 ---\n` });
+            }
+        }
+        return parts;
+    }
+
+    buildUserBubbleText(text, attachments) {
+        let s = (text || "").trim();
+        if (attachments && attachments.length) {
+            const names = attachments.map((a) => a.kind === "file" ? ("📄 " + a.file.name)
+                : a.kind === "image" ? ("🖼️ " + (a.part.name || "图片"))
+                    : ("📝 " + (a.path ? a.path + " 选区" : "选区")));
+            s += (s ? "\n\n" : "") + "📎 " + names.join("、");
+        }
+        return s || "（空消息 + 附件）";
+    }
+
+    /* @ 文件补全 */
+    ensureVaultMdFiles() {
+        if (!this._vaultMdFiles && this.app && this.app.vault) {
+            try { this._vaultMdFiles = this.app.vault.getMarkdownFiles().slice(); }
+            catch (_e) { this._vaultMdFiles = []; }
+        }
+        return this._vaultMdFiles || [];
+    }
+
+    updateAtTrigger() {
+        const ta = this.inputEl;
+        if (!ta) return;
+        const pos = ta.selectionStart;
+        const before = ta.value.slice(0, pos);
+        const m = before.match(/(?:^|\s)@([^\s@]*)$/);
+        if (!m) { if (this._atPopup && this._atPopup.isVisible) this.hideAtPopup(); return; }
+        this.showAtPopup(m[1]);
+    }
+
+    showAtPopup(query) {
+        const files = this.ensureVaultMdFiles();
+        const q = (query || "").toLowerCase();
+        const matched = files
+            .filter((f) => !q || f.path.toLowerCase().includes(q))
+            .sort((a, b) => a.path.length - b.path.length)
+            .slice(0, 50);
+        let popup = this._atPopup;
+        if (!popup) {
+            const el = this.inputEl.parentElement.createDiv("dsh-at-popup");
+            el.style.display = "none";
+            popup = this._atPopup = { el, items: [], index: 0, isVisible: false };
+        }
+        if (!matched.length) {
+            popup.el.empty();
+            const empty = popup.el.createDiv("dsh-at-empty");
+            empty.textContent = "无匹配文件";
+            popup.items = [];
+            popup.index = 0;
+            popup.el.style.display = "block";
+            popup.isVisible = true;
+            return;
+        }
+        popup.el.empty();
+        popup.items = matched;
+        popup.index = 0;
+        for (let i = 0; i < matched.length; i++) {
+            const f = matched[i];
+            const item = popup.el.createDiv("dsh-at-item");
+            item.textContent = f.path;
+            item.addEventListener("mousedown", (ev) => { ev.preventDefault(); this.selectAtFile(f); });
+            if (i === 0) item.addClass("is-active");
+        }
+        popup.el.style.display = "block";
+        popup.isVisible = true;
+    }
+
+    hideAtPopup() {
+        if (this._atPopup) { this._atPopup.el.style.display = "none"; this._atPopup.isVisible = false; }
+    }
+
+    highlightAtItem() {
+        if (!this._atPopup) return;
+        const items = this._atPopup.el.querySelectorAll(".dsh-at-item");
+        items.forEach((el, i) => el.toggleClass("is-active", i === this._atPopup.index));
+    }
+
+    handleAtKeydown(e) {
+        const p = this._atPopup;
+        if (!p || !p.isVisible) return false;
+        if (e.key === "ArrowDown") {
+            e.preventDefault();
+            p.index = Math.min(p.index + 1, p.items.length - 1);
+            this.highlightAtItem();
+            return true;
+        }
+        if (e.key === "ArrowUp") {
+            e.preventDefault();
+            p.index = Math.max(p.index - 1, 0);
+            this.highlightAtItem();
+            return true;
+        }
+        if (e.key === "Enter" || e.key === "Tab") {
+            e.preventDefault();
+            if (p.items.length) this.selectAtFile(p.items[p.index]);
+            return true;
+        }
+        if (e.key === "Escape") {
+            e.preventDefault();
+            this.hideAtPopup();
+            return true;
+        }
+        return false;
+    }
+
+    selectAtFile(file) {
+        const ta = this.inputEl;
+        const pos = ta.selectionStart;
+        const val = ta.value;
+        const before = val.slice(0, pos);
+        const atIdx = before.lastIndexOf("@");
+        if (atIdx >= 0) {
+            const after = val.slice(pos);
+            ta.value = val.slice(0, atIdx) + after;
+            ta.selectionStart = ta.selectionEnd = atIdx;
+        }
+        this.addAttachmentFile(file);
+        this.hideAtPopup();
+        ta.focus();
+    }
+
+    /* ---------- / 技能菜单（Phase B）---------- */
+    // 触发检测：光标前为「行首或空白后跟 /，且 / 到光标间无空格」时弹出
+    updateSlashTrigger() {
+        const ta = this.inputEl;
+        if (!ta) return;
+        const pos = ta.selectionStart;
+        const before = ta.value.slice(0, pos);
+        const m = /(?:^|\s)\/([^\s/]*)$/.exec(before);
+        if (!m) { this.hideSlashPopup(); return; }
+        const query = m[1];
+        this._slashAnchor = pos - query.length - 1; // '/' 字符位置
+        this._slashQuery = query;
+        this.showSlashPopup(query);
+    }
+
+    async showSlashPopup(query) {
+        let popup = this._slashPopup;
+        if (!popup) {
+            // 复用 inputbar 作为容器（与 @ 弹窗同级锚定）
+            const el = this.inputBar && this.inputBar.createDiv("dsh-slash-popup");
+            if (!el) return;
+            el.style.display = "none";
+            popup = this._slashPopup = { el, items: [], index: 0, isVisible: false };
+        }
+        // 先立即显示「加载中…」占位：即便 listSlash 慢或 DSH RPC 挂起，也要先弹出来，
+        // 否则 await 期间弹窗一直是 display:none，表现为“输入 / 不弹出”。
+        popup.el.empty();
+        const loading = popup.el.createDiv("dsh-slash-empty");
+        loading.textContent = "加载中…";
+        popup.el.style.display = "block";
+        popup.isVisible = true;
+        // 列表按需懒加载（每个会话缓存一次）
+        if (this._slashCache == null) {
+            try { this._slashCache = await this.api.listSlash(this.sessionId); }
+            catch (e) { this._slashCache = []; this._slashErr = (e && e.message) ? e.message : String(e); }
+        }
+        const all = this._slashCache || [];
+        const ql = (query || "").toLowerCase();
+        const matched = ql
+            ? all.filter((s) => s.name.toLowerCase().includes(ql) || (s.description || "").toLowerCase().includes(ql))
+            : all;
+        popup.items = matched;
+        popup.index = 0;
+        popup.el.empty();
+        if (matched.length === 0) {
+            const empty = popup.el.createDiv("dsh-slash-empty");
+            empty.textContent = all.length
+                ? "无匹配技能/命令"
+                : ("暂无可用技能（" + (this._slashErr || "DSH 未返回") + "）");
+        } else {
+            for (let i = 0; i < matched.length; i++) {
+                const s = matched[i];
+                const item = popup.el.createDiv("dsh-slash-item");
+                const nameEl = item.createSpan("dsh-slash-name");
+                nameEl.textContent = "/" + s.name;
+                const tag = item.createSpan("dsh-slash-tag");
+                tag.textContent = s.kind === "skill" ? "技能" : "命令";
+                const desc = item.createSpan("dsh-slash-desc");
+                desc.textContent = s.description || "";
+                item.addEventListener("mousedown", (ev) => { ev.preventDefault(); this.selectSlashItem(s); });
+                if (i === 0) item.addClass("is-active");
+            }
+        }
+        popup.el.style.display = "block";
+        popup.isVisible = true;
+    }
+
+    hideSlashPopup() {
+        if (this._slashPopup) { this._slashPopup.el.style.display = "none"; this._slashPopup.isVisible = false; }
+    }
+
+    highlightSlashItem() {
+        if (!this._slashPopup) return;
+        const items = this._slashPopup.el.querySelectorAll(".dsh-slash-item");
+        items.forEach((el, i) => el.toggleClass("is-active", i === this._slashPopup.index));
+    }
+
+    handleSlashKeydown(e) {
+        const p = this._slashPopup;
+        if (!p || !p.isVisible) return false;
+        if (e.key === "ArrowDown") {
+            e.preventDefault();
+            p.index = Math.min(p.index + 1, p.items.length - 1);
+            this.highlightSlashItem();
+            return true;
+        }
+        if (e.key === "ArrowUp") {
+            e.preventDefault();
+            p.index = Math.max(p.index - 1, 0);
+            this.highlightSlashItem();
+            return true;
+        }
+        if (e.key === "Enter" || e.key === "Tab") {
+            e.preventDefault();
+            if (p.items.length) this.selectSlashItem(p.items[p.index]);
+            return true;
+        }
+        if (e.key === "Escape") {
+            e.preventDefault();
+            this.hideSlashPopup();
+            return true;
+        }
+        return false;
+    }
+
+    selectSlashItem(item) {
+        const ta = this.inputEl;
+        const pos = ta.selectionStart;
+        const val = ta.value;
+        const anchor = (this._slashAnchor != null) ? this._slashAnchor : pos;
+        const before = val.slice(0, anchor);
+        const after = val.slice(pos);
+        // 插入 /name + 空格，焦点留在空格后
+        ta.value = before + "/" + item.name + " " + after;
+        const np = before.length + item.name.length + 2;
+        ta.selectionStart = ta.selectionEnd = np;
+        this.hideSlashPopup();
+        ta.focus();
+    }
+
+    /* 图片粘贴 → base64 → image content part */
+    handlePaste(e) {
+        const items = e.clipboardData && e.clipboardData.items;
+        if (!items || !items.length) return;
+        for (const it of items) {
+            if (it.type && it.type.indexOf("image/") === 0) {
+                e.preventDefault();
+                const blob = it.getAsFile();
+                if (!blob) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const dataUrl = reader.result;
+                    const comma = dataUrl.indexOf(",");
+                    const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
+                    const bytes = Math.ceil((base64.length * 3) / 4);
+                    const MAX = 8 * 1024 * 1024; // 8MB 本地预检
+                    if (bytes > MAX) { new Notice("图片过大（>" + Math.round(MAX / 1048576) + "MB），已跳过"); return; }
+                    const ext = (blob.type.split("/")[1] || "png").replace(/[^a-z0-9]/gi, "");
+                    this.addAttachmentImage({ type: "image", mediaType: blob.type, data: base64, name: "pasted-" + Date.now() + "." + ext });
+                };
+                reader.readAsDataURL(blob);
+                return;
+            }
+        }
+    }
+
     /* ---------- 发送 ---------- */
     async send() {
         const text = (this.inputEl && this.inputEl.value || "").trim();
-        if (!text) return;
+        const hasAtt = (this._attachments && this._attachments.length > 0);
+        if (!text && !hasAtt) return;
         if (!this.sessionId) {
             new Notice("请先选择或新建一个会话");
             return;
         }
+        // 关闭 @ 弹窗，快照并清空附件
+        this.hideAtPopup();
+        const attachments = (this._attachments || []).slice();
+        this._attachments = [];
+        this.renderAttachments();
+
         this.lastUserText = text;
         this.inputEl.value = "";
-        this.addUserBubble(text);
+        await this.addUserBubble(this.buildUserBubbleText(text, attachments));
+        // 登记已本地发送的用户文本，防止 DSH 经 WS 回推同一 user/message 时重复渲染（Bug 3）
+        if (!this._userTextsSent) this._userTextsSent = new Set();
+        this._userTextsSent.add(((stripSystemContext(text) || "").replace(/\s+/g, " ").trim()));
         // 重置 turn 生命周期标志，启动「轮询 history 兜底渲染」
         // —— 新建会话的 WS 事件不会被 mux 推送（无 session/subscribed），只能靠 REST history 拿回复
         this._turnDone = false;
         this._contentSetByWs = false;
+        this._gotAssistantChunks = false;
         this._pollStart = Date.now();
         this.beginAssistantBubble();
+        this._running = true;
+        this.setLiveBar("思考中…");
         this.startTurnPoll();
         try {
             // 若加载会话时正在后台纠正默认模型大小写，先等它完成，避免 prompt 抢跑仍用错误模型
@@ -1436,9 +2513,12 @@ class DshNativeView extends ItemView {
                 try { await this._modelFixPromise; } catch (_e) { /* 忽略，继续用原模型发送 */ }
                 this._modelFixPromise = null;
             }
-            // 当前 mode 从 settings 取（用户在底部段控件切换后已持久化）
-            const curMode = (this.plugin && this.plugin.settings && this.plugin.settings.mode) || "queue";
-            const resp = await this.api.prompt(this.sessionId, text, curMode);
+            // 当前 mode：默认取 settings；若正在生成中又发消息，则走 steer（运行中追加/引导，Phase F）
+            const curMode = this._running
+                ? "steer"
+                : ((this.plugin && this.plugin.settings && this.plugin.settings.mode) || "queue");
+            const parts = this.buildPromptParts(text, attachments);
+            const resp = await this.api.prompt(this.sessionId, parts, curMode);
             this.diagLastPrompt = "prompt:ok " + JSON.stringify(resp || {}).slice(0, 120);
             this.updateDiag();
         } catch (e) {
@@ -1450,7 +2530,7 @@ class DshNativeView extends ItemView {
         }
     }
 
-    async addUserBubble(text) {
+    async addUserBubble(text, atTop = false) {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-user");
         // 修复 Bug 3：强制可见，避免被父级 flex 容器异常折叠
         bubble.style.display = "flex";
@@ -1458,6 +2538,8 @@ class DshNativeView extends ItemView {
         content.style.minHeight = "1.5em";
         const stamp = "u-" + (++this._userSeq || (this._userSeq = 1));
         bubble.dataset.stamp = stamp;
+        // 向上翻页时插到顶部，保持阅读位置
+        if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
         try {
             await MarkdownRenderer.render(this.app, text, content, "", this);
         } catch (_e) {
@@ -1465,8 +2547,8 @@ class DshNativeView extends ItemView {
             const pre = content.createEl("pre", { cls: "dsh-msg-fallback" });
             pre.textContent = text;
         }
-        // 渲染完成后再滚到底，确保用户消息可见
-        this.scrollToBottom();
+        // 渲染完成后再滚到底（仅首屏/实时发送，翻页由 loadHistory 自行控制位置）
+        if (!atTop) this.scrollToBottom();
     }
 
     beginAssistantBubble() {
@@ -1560,7 +2642,12 @@ class DshNativeView extends ItemView {
         }
         const finished = t.endsWith("-end");
         const label = (() => {
-            if (t.startsWith("tool-")) return "🔧 调用工具：" + (data.name || data.toolName || "工具");
+            if (t.startsWith("tool-")) {
+                // 子代理伪装成 tool/call：换脸成 👥 子代理（Bug 4 核心修复）
+                const sa = subagentMeta(data.name || data.toolName, data.args || data.input || data);
+                if (sa) return sa;
+                return "🔧 调用工具：" + (data.name || data.toolName || "工具");
+            }
             if (t === "agent-start" || t === "agent-end") return "👥 Agent：" + (data.name || data.agentId || "");
             if (t === "subagent-start" || t === "subagent-end") {
                 const task = data.task || data.description || "";
@@ -1587,6 +2674,8 @@ class DshNativeView extends ItemView {
                     : (data.error ? ("出错：" + String(data.error).slice(0, 200)) : "");
                 if (preview) row.detail.textContent = " — " + preview;
             } catch (_e) { /* 忽略序列化失败 */ }
+            // 所有活动都完成后清除 live 指示条
+            if (!this._hasRunningActivity()) this.clearLiveBar();
         } else if (!finished) {
             if (data.args || data.input) {
                 const a = data.args || data.input;
@@ -1595,6 +2684,8 @@ class DshNativeView extends ItemView {
             } else if (data.progress) {
                 row.detail.textContent = " — " + String(data.progress).slice(0, 200);
             }
+            // 运行中：在 composer 上方显示「正在执行：XXX」（Bug 4 增强）
+            this.setLiveBar(label);
         }
         this.scrollToBottom();
     }
@@ -1639,15 +2730,17 @@ class DshNativeView extends ItemView {
         this.scrollToBottom();
     }
     // 历史会话里的单条助手回复（静态，不占用 this.assistantEl）
-    renderStaticAssistant(text, thinking) {
+    renderStaticAssistant(text, thinking, atTop = false) {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-assistant");
         bubble.createDiv("dsh-msg-role").textContent = "DSH";
         const content = bubble.createDiv("dsh-msg-content");
         this.renderThinkingAndText(content, text, thinking);
-        this.scrollToBottom();
+        if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
+        // 注意：滚动由 loadHistory 控制（首屏到底 / 翻页保持位置），此处不自动滚
     }
 
-    // 把 Obsidian 渲染后的 <pre><code class="language-dsh-ui"> 替换成 dsh-ui 富卡片
+    // 把 Obsidian 渲染后的 <pre><code class="language-dsh-ui"> 替换成 dsh-ui 富卡片。
+    // 解析失败（流式未完成 / 畸形）时：turn 进行中显示「⚙️ 组件生成中…」，已结束显示「⚠️ 渲染失败」+ 原始折叠。
     postProcessDshUi(el) {
         if (!el || !el.querySelectorAll) return;
         el.querySelectorAll("pre").forEach((pre) => {
@@ -1656,15 +2749,39 @@ class DshNativeView extends ItemView {
             const cls = (code.className || "") + " " + (code.getAttribute("data-language") || "") + " " + (code.getAttribute("lang") || "");
             const text = (code.textContent || "").trim();
             const isDshUi = /dsh-ui/i.test(cls);
-            const looksLikeSpec = text.startsWith("{") && text.includes('"items"') && text.includes('"type"');
+            const looksLikeSpec = text.startsWith("{") && (text.includes('"items"') || text.includes('"type"') || text.includes('"title"'));
             if (!isDshUi && !looksLikeSpec) return;
-            let spec;
-            try { spec = JSON.parse(text); } catch (_e) { return; }
-            if (!spec || typeof spec !== "object" || !Array.isArray(spec.items)) return;
-            let html;
-            try { html = dshUiRenderSpec(spec); } catch (_e) { return; }
+            const spec = parseSpec(text);
+            if (spec && Array.isArray(spec.items) && (typeof spec.type === "string" || typeof spec.title === "string")) {
+                let html;
+                try { html = dshUiRenderSpec(spec); } catch (_e) { return; }
+                const wrap = document.createElement("div");
+                wrap.innerHTML = html;
+                try { pre.replaceWith(wrap); } catch (_e) {}
+                return;
+            }
+            // 解析失败：占位处理
+            const done = !!this._turnDone;
             const wrap = document.createElement("div");
-            wrap.innerHTML = html;
+            wrap.className = "dui " + (done ? "dui-broken" : "dui-pending");
+            if (done) {
+                const callout = document.createElement("div");
+                callout.className = "dui-callout dui-callout-warning";
+                callout.textContent = "⚠️ 组件渲染失败（JSON 无法解析）";
+                const details = document.createElement("details");
+                const sum = document.createElement("summary");
+                sum.className = "muted";
+                sum.textContent = "原始内容";
+                const pre2 = document.createElement("pre");
+                pre2.className = "code-block";
+                pre2.textContent = text;
+                details.appendChild(sum);
+                details.appendChild(pre2);
+                wrap.appendChild(callout);
+                wrap.appendChild(details);
+            } else {
+                wrap.textContent = "⚙️ 组件生成中…";
+            }
             try { pre.replaceWith(wrap); } catch (_e) {}
         });
     }
@@ -1677,10 +2794,13 @@ class DshNativeView extends ItemView {
         this.assistantMd = "";
         this.thinkingMd = "";
         this._turnDone = true;
+        this._running = false;
         this._stopPoll();
         // 重置工具/子代理活动跟踪（Bug 4 —— 下一轮从空开始）
         this._activities = new Map();
         this._activityHolder = null;
+        // turn 结束：清除实时活动指示条（无论是否还有残留活动）
+        this.clearLiveBar();
     }
 
     _stopPoll() {
@@ -1771,47 +2891,81 @@ class DshNativeView extends ItemView {
     }
 
     // 渲染某会话的历史对话（切到该会话时调用，对齐 VSCode/Claudian）
-    async loadHistory(id) {
+    // beforeSeq：向上翻页游标（传当前最旧事件 seq 拉更早一批）；null 表示首屏最近 24 条
+    async loadHistory(id, beforeSeq = null) {
         if (!this.messagesEl) return;
         try {
-            const h = await this.api.getHistory(id);
+            const h = await this.api.getHistory(id, beforeSeq, 24);
             const events = (h && h.events) || (h && h.result && h.result.value && h.result.value.events) || [];
-            // 按时间顺序收集 user / assistant(turn) 条目，只渲染最近若干条避免卡顿
-            const items = [];
-            let buf = null;
-            for (const e of events) {
-                const ev = e.event || {};
-                if (ev.type === "user/message") {
-                    items.push({ role: "user", ev });
-                } else if (ev.type === "turn/start") {
-                    buf = { text: "", thinking: "" };
-                } else if (ev.type === "assistant/chunk" && buf) {
-                    const ch = ev.data && ev.data.chunk;
-                    if (!ch) continue;
-                    if (ch.type === "text-delta" && typeof ch.text === "string") buf.text += ch.text;
-                    else if (ch.type === "reasoning-delta" && typeof ch.text === "string") buf.thinking += ch.text;
-                } else if (ev.type === "assistant/message" && buf && !buf.text) {
-                    const m = ev.data && (ev.data.message || ev.data.content || ev.data);
-                    const mt = typeof m === "string" ? m : (m && m.content);
-                    if (typeof mt === "string") buf.text = mt;
-                } else if (ev.type === "turn/end" && buf) {
-                    items.push({ role: "assistant", text: buf.text, thinking: buf.thinking });
-                    buf = null;
-                }
+            // 记录翻页边界（events 按时间正序，[0] 是最旧一条的 seq）
+            if (events.length) {
+                const firstSeq = events[0].event && events[0].event.seq;
+                if (typeof firstSeq === "number") this._oldestSeq = firstSeq;
             }
-            if (buf) items.push({ role: "assistant", text: buf.text, thinking: buf.thinking });
-            const recent = items.slice(-24);
-            for (const it of recent) {
-                if (it.role === "user") this.addUserBubbleFromEvent(it.ev);
-                else this.renderStaticAssistant(it.text, it.thinking);
+            this._hasMore = !!h.hasMore;
+            const items = this._eventsToItems(events);
+            if (!beforeSeq) {
+                // 首屏：只渲染最近 24 条，滚到底
+                const recent = items.slice(-24);
+                for (const it of recent) this._renderHistoryItem(it, false);
+                this.scrollToBottom();
+            } else {
+                // 向上翻页：在顶部插入更早的一批，保持当前阅读位置（不跳动）
+                const oldHeight = this.messagesEl.scrollHeight;
+                const oldTop = this.messagesEl.scrollTop;
+                for (const it of items) this._renderHistoryItem(it, true);
+                const newHeight = this.messagesEl.scrollHeight;
+                this.messagesEl.scrollTop = newHeight - oldHeight + oldTop;
             }
-            this.scrollToBottom();
         } catch (_e) {
             /* 历史加载失败不阻塞 */
         }
     }
 
-    addUserBubbleFromEvent(ev) {
+    _eventsToItems(events) {
+        // 把 WS/历史 events 重建成 user / assistant(turn) 条目（与 VSCode fold 同逻辑）
+        const items = [];
+        let buf = null;
+        for (const e of events) {
+            const ev = e.event || {};
+            if (ev.type === "user/message") {
+                items.push({ role: "user", ev });
+            } else if (ev.type === "turn/start") {
+                buf = { text: "", thinking: "" };
+            } else if (ev.type === "assistant/chunk" && buf) {
+                const ch = ev.data && ev.data.chunk;
+                if (!ch) continue;
+                if (ch.type === "text-delta" && typeof ch.text === "string") buf.text += ch.text;
+                else if (ch.type === "reasoning-delta" && typeof ch.text === "string") buf.thinking += ch.text;
+            } else if (ev.type === "assistant/message" && buf && !buf.text) {
+                const m = ev.data && (ev.data.message || ev.data.content || ev.data);
+                const mt = typeof m === "string" ? m : (m && m.content);
+                if (typeof mt === "string") buf.text = mt;
+            } else if (ev.type === "turn/end" && buf) {
+                items.push({ role: "assistant", text: buf.text, thinking: buf.thinking });
+                buf = null;
+            }
+        }
+        if (buf) items.push({ role: "assistant", text: buf.text, thinking: buf.thinking });
+        return items;
+    }
+
+    _renderHistoryItem(it, atTop) {
+        if (it.role === "user") this.addUserBubbleFromEvent(it.ev, atTop);
+        else this.renderStaticAssistant(it.text, it.thinking, atTop);
+    }
+
+    // 向上翻页：拉取比当前最旧事件更早的一批历史
+    async loadOlder() {
+        if (this._loadingOlder || !this._hasMore || this._oldestSeq == null || !this.sessionId) return;
+        this._loadingOlder = true;
+        try {
+            await this.loadHistory(this.sessionId, this._oldestSeq);
+        } catch (_e) { /* 忽略 */ }
+        finally { this._loadingOlder = false; }
+    }
+
+    addUserBubbleFromEvent(ev, atTop = false) {
         const d = ev.data || ev;
         let text = "";
         if (typeof d.text === "string") text = d.text;
@@ -1825,16 +2979,58 @@ class DshNativeView extends ItemView {
         const cleaned = stripSystemContext(text);
         if (!cleaned) return; // 整段都是注入就别渲染
         // 去重：send() 已本地渲染过的、DSH 又回推的 user/message 不显示第二次
+        const key = (cleaned.replace(/\s+/g, " ").trim());
         if (!this._userTextsSent) this._userTextsSent = new Set();
-        const key = cleaned.slice(0, 200);
         if (this._userTextsSent.has(key)) return;
-        if (this._userTextsSent.size >= 32) this._userTextsSent.clear(); // 简单抗膨胀
+        if (this._userTextsSent.size >= 64) this._userTextsSent.clear(); // 简单抗膨胀
         this._userTextsSent.add(key);
-        this.addUserBubble(cleaned);
+        // 实时候推防重复（关键修复）：DSH 会在发送后以 user/message 回推同一条消息。
+        // 若末尾已是助手气泡（本地用户消息已在其上）或直接是文本一致的用户气泡，跳过，
+        // 避免用户消息被追加到 AI 回复之下导致顺序错乱。仅对实时候推（atTop=false）生效，
+        // 历史翻页（atTop=true）不受影响。
+        if (!atTop && this.messagesEl) {
+            const last = this.messagesEl.lastElementChild;
+            if (last) {
+                if (last.classList.contains("dsh-msg-assistant")) return;
+                if (last.classList.contains("dsh-msg-user")) {
+                    const c = last.querySelector(".dsh-msg-content");
+                    if (c && (c.textContent || "").replace(/\s+/g, " ").trim() === key) return;
+                }
+            }
+        }
+        this.addUserBubble(cleaned, atTop);
     }
 
     scrollToBottom() {
         if (this.messagesEl) this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+    }
+
+    // 实时活动指示条（composer 上方）：子代理/工具执行中显示「正在执行：XXX」（Bug 4 增强）
+    // 内含停止按钮（仅运行中可见），Esc 亦可中断（Phase A）
+    setLiveBar(text) {
+        if (!this.liveBar) return;
+        if (this.liveBarLabel) this.liveBarLabel.textContent = text; // 文案与 VSCode 一致（正在执行：… / 思考中…），旋转指示由 .dsh-spinner 承担
+        this.liveBar.style.display = "flex";
+    }
+    clearLiveBar() {
+        if (!this.liveBar) return;
+        this.liveBar.style.display = "none";
+        if (this.liveBarLabel) this.liveBarLabel.textContent = "";
+    }
+    // Phase A：向 DSH 发送 session.cancel，中断当前生成中的 turn
+    requestCancel() {
+        if (!this.sessionId) return;
+        this.api.cancel(this.sessionId).catch(() => {});
+        new Notice("已发送中断请求");
+    }
+    // 检查是否还有未完成的工具/子代理活动
+    _hasRunningActivity() {
+        if (!this._activities) return false;
+        for (const [k, v] of this._activities) {
+            if (k === "__overflow__") continue;
+            if (v && !v.finished) return true;
+        }
+        return false;
     }
 
     /* ---------- WebSocket 事件流（订阅 plugin 主进程手写 WS 客户端，规避 Chromium 全局 WS 的 Origin 拦截） ---------- */
@@ -1894,6 +3090,15 @@ class DshNativeView extends ItemView {
         this.statusLine.setText(parts.join("  "));
     }
 
+    // token 用量行（对齐 VSCode .composer-meta）：控制条下方右对齐小字，无数据时隐藏
+    updateComposerMeta() {
+        if (!this.composerMeta) return;
+        const t = this.diagTokens || "";
+        if (!t) { this.composerMeta.style.display = "none"; return; }
+        this.composerMeta.textContent = t;
+        this.composerMeta.style.display = "";
+    }
+
     closeWs() {
         if (this._frameHandler) this.plugin.wsUnsubscribe(this._frameHandler);
         if (this._statusHandler) this.plugin.wsStatusUnsubscribe(this._statusHandler);
@@ -1915,6 +3120,10 @@ class DshNativeView extends ItemView {
                 break;
             case "session/projection":
                 this.handleProjection(payload);
+                break;
+            case "session/queue":
+                // Phase F：运行中追加的排队消息（DSH 在每次连接时重放基线）
+                this.renderQueueStrip(payload);
                 break;
             case "approval/requested":
                 this.handleApproval(payload, frame.rpcId);
@@ -1943,7 +3152,10 @@ class DshNativeView extends ItemView {
                 break;
             }
             case "turn/start":
+                this._gotAssistantChunks = false;
                 this.beginAssistantBubble();
+                this._running = true;
+                this.setLiveBar("思考中…");
                 break;
             case "assistant/chunk": {
                 const chunk = ev.data && ev.data.chunk;
@@ -1957,6 +3169,7 @@ class DshNativeView extends ItemView {
                 if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
                     if (typeof chunk.text !== "string" || chunk.text.length === 0) break;
                     this._contentSetByWs = true;
+                    if (chunk.type === "text-delta") this._gotAssistantChunks = true;
                     this.appendAssistant(chunk.text, chunk.type === "reasoning-delta");
                     break;
                 }
@@ -1977,7 +3190,16 @@ class DshNativeView extends ItemView {
                 break;
             }
             case "assistant/message": {
-                // 兜底：若后续 chunk 含有完整消息体且流式未渲染，再用它覆盖（这里保守起见不动 UI）
+                // 兜底：DSH 有时把整段回复（含注入块）放在 assistant/message，而非走
+                // assistant/chunk 流式（VSCode fold.ts:129 同样做 strip 兜底）。剥系统上下文后渲染。
+                // 若本轮已收到 text-delta 流式内容，跳过避免重复（chunk 与 message 不会同时到）。
+                if (this._gotAssistantChunks) break;
+                const m = ev.data && (ev.data.message || ev.data.content || ev.data);
+                const raw = typeof m === "string" ? m : (m && m.content);
+                if (typeof raw === "string" && raw) {
+                    const cleaned = preprocessAssistantText(raw);
+                    if (cleaned && cleaned.trim()) this.appendAssistant(cleaned, false);
+                }
                 break;
             }
             case "turn/end":
@@ -1997,13 +3219,25 @@ class DshNativeView extends ItemView {
             if (v.cacheReadTokens != null) parts.push(`cache ${v.cacheReadTokens}`);
             this.diagTokens = parts.join("  ·  ");
             this.updateDiag();
+            this.updateComposerMeta();
         } else if (p.key === "title" && this.sessionId) {
-            // 更新当前会话标题
+            // 更新当前会话标题；若用户手动重命名过（manualTitles），则不覆盖本地覆盖
             const s = this.sessions.find((x) => x.sessionId === this.sessionId);
-            if (s && typeof p.value === "string" && p.value) {
+            const override = this.plugin && this.plugin.settings && this.plugin.settings.manualTitles
+                ? this.plugin.settings.manualTitles[this.sessionId] : null;
+            if (s && !override && typeof p.value === "string" && p.value) {
                 s.title = p.value;
-                this.renderTabs();
+                this.renderSessionList();
+                this.updateTitleBtn();
             }
+        } else if (p.key === "plan") {
+            // plan 投影：{active:boolean, ...}（VSCode manager.ts:251 同款）
+            this._planActive = !!(p.value && p.value.active);
+            this.renderPlanStrip();
+        } else if (p.key === "todos") {
+            // todos 投影：[{content, status}]（status: pending|in_progress|completed）
+            this._todos = Array.isArray(p.value) ? p.value : null;
+            this.renderPlanStrip();
         } else if (p.key === "permissions") {
             // 实时更新当前权限值（投影通道），并刷新 revision 以便下次写入不冲突
             if (!this.permSelect) return;
@@ -2030,6 +3264,82 @@ class DshNativeView extends ItemView {
             if (typeof p.seq === "number") this._permRevision = p.seq;
             if (typeof p.revision === "number") this._permRevision = p.revision;
         }
+    }
+
+    // Phase E：Plan 模式横幅 + Todo 进度条（由 session/projection 的 plan/todos 驱动）
+    // 对齐 VSCode dsh-vscode/webview/src/app.tsx:507 的 plan-strip / todo-strip
+    renderPlanStrip() {
+        const strip = this.planStrip;
+        if (!strip) return;
+        strip.empty();
+        let has = false;
+        if (this._planActive) {
+            has = true;
+            const banner = strip.createDiv("dsh-plan-banner");
+            banner.createSpan({ text: "🗺 Plan 模式 — 只读研究，方案需批准后执行" });
+            const off = banner.createEl("button", { cls: "dsh-link-btn", text: "退出" });
+            off.addEventListener("click", () => {
+                if (this.sessionId) {
+                    this.api.prompt(this.sessionId, [{ type: "text", text: "/plan off" }], "queue").catch(() => {});
+                }
+            });
+        }
+        if (this._todos && this._todos.length) {
+            has = true;
+            const done = this._todos.filter((t) => t.status === "completed").length;
+            const cur = this._todos.find((t) => t.status === "in_progress");
+            const head = strip.createEl("div", { cls: "dsh-todo-strip" });
+            const count = head.createSpan("dsh-todo-count");
+            count.textContent = `${done}/${this._todos.length}`;
+            const bar = head.createDiv("dsh-todo-bar");
+            const fill = bar.createDiv("dsh-todo-bar-fill");
+            fill.style.width = `${this._todos.length ? (done / this._todos.length) * 100 : 0}%`;
+            const curEl = head.createSpan("dsh-todo-cur");
+            curEl.textContent = cur ? cur.content : (done === this._todos.length ? "全部完成" : "…");
+            const chev = head.createSpan("dsh-todo-chev");
+            chev.textContent = this._todoOpen ? "▾" : "▸";
+            // 点击表头展开/收起任务清单
+            if (this._todoOpen == null) this._todoOpen = false;
+            head.addEventListener("click", () => {
+                this._todoOpen = !this._todoOpen;
+                this.renderPlanStrip();
+            });
+            if (this._todoOpen) {
+                const list = strip.createEl("ul", { cls: "dsh-todo-list" });
+                for (const t of this._todos) {
+                    const li = list.createEl("li", { cls: "dsh-todo-item is-" + (t.status || "pending") });
+                    li.createSpan({ cls: "dsh-todo-mark", text: t.status === "completed" ? "✓" : t.status === "in_progress" ? "●" : "○" });
+                    li.appendText(t.content || "");
+                }
+            }
+        }
+        strip.style.display = has ? "" : "none";
+    }
+
+    // Phase F：排队队列条（由 session/queue 帧驱动，展示运行中追加、尚未执行的消息）
+    // 对齐 VSCode .queue-strip：虚线 chip 横排，⇢=插队(steering) ⏳=排队
+    renderQueueStrip(payload) {
+        const strip = this.queueStrip;
+        if (!strip) return;
+        strip.empty();
+        const items = (payload && Array.isArray(payload.items)) ? payload.items : [];
+        if (!items.length) { strip.style.display = "none"; return; }
+        for (const it of items) {
+            const text = ((it.content || []).map((c) => c.text || "").join("") || "").trim() || "（空消息）";
+            const chip = strip.createDiv("dsh-queue-chip");
+            chip.setAttribute("title", text);
+            const pre = chip.createSpan("dsh-queue-pre");
+            pre.textContent = it.placement === "steering" ? "⇢" : "⏳";
+            const txt = chip.createSpan("dsh-queue-text");
+            txt.textContent = text.length > 40 ? text.slice(0, 40) + "…" : text;
+            const rm = chip.createEl("span", { cls: "dsh-icon-btn dsh-icon-mini dsh-queue-rm", text: "×", attr: { title: "移除" } });
+            rm.addEventListener("click", () => {
+                if (this.sessionId && it.id) {
+                    this.api.queueRemove(this.sessionId, it.id).catch(() => {});
+                }
+            });
+        }
+        strip.style.display = "";
     }
 
     /* ---------- 审批 / 提问 ---------- */
@@ -2445,6 +3755,15 @@ class DshNativePlugin extends Plugin {
             id: "send-note-to-dsh",
             name: "发送当前笔记到 DSH",
             callback: () => this.sendCurrentNote(),
+        });
+        this.addCommand({
+            id: "attach-active-context",
+            name: "引用选区/笔记到 DSH（Alt+K）",
+            callback: () => {
+                const view = this.getView();
+                if (!view) { new Notice("请先打开 DSH 面板"); return; }
+                view.attachActiveContext();
+            },
         });
 
         this.addSettingTab(new DshNativeSettingTab(this.app, this));

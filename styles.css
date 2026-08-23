@@ -8,45 +8,153 @@
     height: 100%;
     overflow: hidden;
     background: var(--background-primary);
+    /* 对齐 VSCode webview 基准字号（--vscode-font-size 默认 13px） */
+    font-size: 13px;
 }
 
-/* 头部 */
+/* ===== 头部（1:1 对齐 VSCode .header：状态点 + 标题下拉 + ✎ + 模式chip + spacer + ＋） ===== */
+/* 数值取自 dsh-vscode/webview/src/styles.css；颜色映射到 Obsidian 变量，点色用 VSCode 字面值 */
 .dsh-native-header {
     display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    flex: 0 0 auto;
+    background: var(--background-primary);
+}
+.dsh-native-header-top {
+    display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
+    gap: 6px;
+    padding: 6px 8px;
     border-bottom: 1px solid var(--background-modifier-border);
     flex: 0 0 auto;
+    min-width: 0;
 }
-.dsh-native-title {
-    font-weight: 600;
-    font-size: var(--font-ui-small);
+.dsh-title-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: none;
     color: var(--text-normal);
+    cursor: pointer;
+    padding: 2px 4px;
+    text-align: left;
+    font-size: inherit;
 }
+.dsh-title-btn:hover { background: var(--background-modifier-hover); }
+.dsh-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-chev { color: var(--text-muted); }
+
+.dsh-icon-btn {
+    background: none;
+    border: none;
+    color: var(--text-normal);
+    cursor: pointer;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: inherit;
+    line-height: 1.4;
+    flex: 0 0 auto;
+}
+.dsh-icon-btn:hover { background: var(--background-modifier-hover); }
+.dsh-icon-btn.dsh-icon-mini { font-size: 11px; padding: 0 4px; }
+.dsh-spacer { flex: 1 1 auto; min-width: 0; }
+
 .dsh-status-dot {
-    width: 9px;
-    height: 9px;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: var(--text-faint);
     flex: 0 0 auto;
+    display: inline-block;
 }
-.dsh-status-dot.online { background: var(--interactive-success, #3fb950); }
-.dsh-status-dot.connecting { background: var(--text-warning, #d29922); }
-.dsh-status-dot.offline { background: var(--text-error, #f44336); }
-.dsh-session-select {
+.dsh-status-dot.online { background: #73c991; }      /* = VSCode testing-iconPassed */
+.dsh-status-dot.connecting { background: #cca700; }  /* = VSCode charts-yellow */
+.dsh-status-dot.offline { background: #f14c4c; }     /* = VSCode testing-iconFailed */
+
+/* 会话列表下拉（对齐 VSCode .session-list，随文档流展开） */
+.dsh-session-list {
+    max-height: 240px;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--background-modifier-border);
+    flex: 0 0 auto;
+}
+.dsh-session-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+}
+.dsh-session-row:hover { background: var(--background-modifier-hover); }
+.dsh-session-row.is-current {
+    background: color-mix(in srgb, var(--interactive-accent) 16%, transparent);
+    color: var(--text-normal);
+}
+.dsh-session-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; display: inline-block; }
+.dsh-dot-running { background: #3794ff; animation: dsh-pulse 1.2s infinite; } /* = VSCode charts-blue */
+.dsh-dot-idle { background: var(--text-muted); }
+
+/* 改名栏（对齐 VSCode .rename-bar） */
+.dsh-rename-bar {
+    display: flex;
+    gap: 6px;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    align-items: center;
+    flex: 0 0 auto;
+}
+.dsh-rename-input {
     flex: 1 1 auto;
     min-width: 0;
-    max-width: 100%;
+    margin-top: 0;
+    padding: 3px 6px;
+    background: var(--background-modifier-form-field);
+    color: var(--text-normal);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    font-size: inherit;
 }
+
+/* chip 按钮（对齐 VSCode .chip-btn）：模式切换 / 模型 / 思考强度 / 权限 / Agent 模式共用 */
+.dsh-chip-btn {
+    background: rgba(128, 128, 128, 0.08);
+    color: var(--text-normal);
+    border: 1px solid rgba(128, 128, 128, 0.35);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11.5px;
+    cursor: pointer;
+    flex: 0 0 auto;
+    max-width: 240px;
+    text-overflow: ellipsis;
+}
+select.dsh-chip-btn { max-width: 220px; }
+.dsh-perm-select { max-width: 160px !important; }
+.dsh-effort-select { max-width: 120px !important; }
+.dsh-preset-select { max-width: 150px !important; }
+.dsh-chip-btn.is-on {
+    border-color: var(--interactive-accent);
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+}
+.dsh-chip-btn.is-locked { cursor: default; opacity: 0.85; }
+.dsh-chip-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.dsh-preset-slot { display: inline-flex; align-items: center; min-width: 0; }
+
 .dsh-btn {
     cursor: pointer;
     border: 1px solid var(--background-modifier-border);
-    background: var(--background-secondary);
+    background: transparent;
     color: var(--text-normal);
-    border-radius: var(--radius-s);
-    padding: 2px 8px;
-    font-size: var(--font-ui-small);
+    border-radius: 4px;
+    padding: 3px 12px;
+    font-size: 12px;
 }
 .dsh-btn:hover { background: var(--background-modifier-hover); }
 .dsh-btn.mod-cta {
@@ -54,15 +162,16 @@
     color: var(--text-on-accent);
     border-color: var(--interactive-accent);
 }
+.dsh-btn.mod-cta:hover { filter: brightness(1.08); }
 
 /* 消息区 */
 .dsh-native-messages {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: 10px;
+    padding: 14px 14px 18px 14px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 16px;
 }
 .dsh-msg {
     display: flex;
@@ -75,18 +184,27 @@
     color: var(--text-faint);
 }
 .dsh-msg-content {
-    padding: 8px 10px;
-    border-radius: var(--radius-m);
-    line-height: 1.5;
+    padding: 0;
+    border-radius: 0;
+    /* Phase 7：AI 去气泡、纯散文阅读；CJK 14px / 行高 1.7 */
+    line-height: 1.7;
+    font-size: 14px;
+    font-family: var(--font-text), "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
     overflow-wrap: anywhere;
+    color: var(--text-normal);
 }
 .dsh-msg-user .dsh-msg-content {
+    /* 用户消息保留轻量 chip 区分，不做重气泡 */
     background: var(--background-secondary);
-    border: 1px solid var(--background-modifier-border);
+    border: none;
+    border-radius: var(--radius-s);
+    padding: 8px 12px;
 }
 .dsh-msg-assistant .dsh-msg-content {
-    background: var(--background-primary-alt);
-    border: 1px solid var(--background-modifier-border);
+    /* 助手消息：纯散文，无背景无边框 */
+    background: none;
+    border: none;
+    padding: 0;
 }
 .dsh-msg-content p:first-child { margin-top: 0; }
 .dsh-msg-content p:last-child { margin-bottom: 0; }
@@ -123,89 +241,96 @@
     display: none !important;
 }
 
-/* 控制条：移到面板最底部，单行紧凑展示（对齐 VSCode DSH 底部状态栏） */
+/* 控制条（对齐 VSCode .composer-actions）：透明、无第二条分隔线，chip 自带边框 */
 .dsh-native-controls {
-    order: 4;
+    order: 7;
     flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 4px 10px;
-    border-top: 1px solid var(--background-modifier-border);
-    background: var(--background-secondary);
-    font-size: var(--font-ui-smaller);
+    margin-top: 4px;
+    padding: 2px 8px 8px;
+    background: transparent;
+    font-size: 11.5px;
     color: var(--text-muted);
-    flex-wrap: nowrap;
-    overflow-x: auto;
+    flex-wrap: wrap;
+}
+/* token 用量行（对齐 VSCode .composer-meta） */
+.dsh-composer-meta {
+    order: 8;
+    margin-top: 0;
+    padding: 0 10px 6px;
+    font-size: 10.5px;
+    color: var(--text-muted);
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 0 0 auto;
 }
 .dsh-native-header { order: 0; }
 .dsh-native-messages { order: 1; }
 .dsh-native-statusline { order: 2; }
-.dsh-native-inputbar { order: 3; }
-.dsh-ctl-label {
-    font-weight: 600;
-    color: var(--text-faint);
-    margin-right: 2px;
+/* 底部条带顺序对齐 VSCode：队列 → 运行中 → Plan/Todo → 输入区 → chips → 用量行 */
+.dsh-queue-strip { order: 3; }
+.dsh-native-livebar { order: 4; }
+.dsh-plan-strip { order: 5; }
+.dsh-native-inputbar { order: 6; }
+.dsh-native-controls { order: 7; }
+.dsh-composer-meta { order: 8; }
+/* 运行指示条（对齐 VSCode .live-bar）：composer 正上方的通栏信息条 */
+.dsh-native-livebar {
+    order: 4;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    margin: 0;
+    border-radius: 0;
+    font-size: 11.5px;
+    color: var(--text-normal);
+    background: rgba(70, 130, 220, 0.14);
+    border-top: 1px solid rgba(70, 130, 220, 0.35);
 }
-.dsh-mode-toggle {
-    display: inline-flex;
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-s);
-    overflow: hidden;
-    margin-right: 4px;
+.dsh-livebar-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 旋转指示（对齐 VSCode .spinner） */
+.dsh-spinner {
+    flex: none;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: currentColor;
+    border-right-color: currentColor;
+    animation: dsh-spin 0.8s linear infinite;
 }
-.dsh-mode-btn {
-    border: none;
-    background: var(--background-primary);
-    color: var(--text-muted);
-    padding: 2px 10px;
-    font-size: var(--font-ui-smaller);
+@keyframes dsh-spin { to { transform: rotate(360deg); } }
+/* 停止 = 链接式文字按钮（对齐 VSCode .link-btn） */
+.dsh-native-stopbtn {
+    flex: 0 0 auto;
     cursor: pointer;
-    border-right: 1px solid var(--background-modifier-border);
+    background: none;
+    border: none;
+    color: var(--text-accent);
+    padding: 0 4px;
+    font-size: inherit;
+    font-weight: normal;
+    line-height: inherit;
 }
-.dsh-mode-btn:last-child { border-right: none; }
-.dsh-mode-btn.is-active {
-    background: var(--interactive-accent);
-    color: var(--text-on-accent);
-    font-weight: 600;
-}
-.dsh-model-select {
-    background: var(--background-primary);
-    color: var(--text-normal);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-s);
-    padding: 2px 6px;
-    font-size: var(--font-ui-smaller);
-    max-width: 220px;
-}
-.dsh-model-select:disabled { opacity: 0.55; cursor: not-allowed; }
-.dsh-perm-select {
-    background: var(--background-primary);
-    color: var(--text-normal);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--radius-s);
-    padding: 2px 6px;
-    font-size: var(--font-ui-smaller);
-    max-width: 160px;
-}
-.dsh-perm-select:disabled { opacity: 0.55; cursor: not-allowed; }
-.dsh-perm-value {
-    color: var(--text-normal);
-    font-family: var(--font-monospace, monospace);
-    background: var(--background-primary);
-    padding: 2px 6px;
-    border-radius: var(--radius-s);
-    border: 1px solid var(--background-modifier-border);
-}
+.dsh-native-stopbtn:hover { text-decoration: underline; }
+/* （旧版 dsh-ctl-label / dsh-mode-toggle / dsh-model-select 独立样式已删除：
+   底部控件统一走 .dsh-chip-btn，对齐 VSCode composer-actions） */
 
 /* 输入栏 */
 .dsh-native-inputbar {
+    position: relative; /* Phase 6：@ 文件补全弹窗绝对定位锚点 */
     flex: 0 0 auto;
     display: flex;
+    flex-direction: column;
     gap: 6px;
     padding: 8px 10px;
     border-top: 1px solid var(--background-modifier-border);
-    align-items: flex-end;
+    align-items: stretch;
 }
 .dsh-native-input {
     flex: 1 1 auto;
@@ -217,7 +342,8 @@
     color: var(--text-normal);
     border: 1px solid var(--background-modifier-border);
     border-radius: var(--radius-s);
-    padding: 9px 10px;
+    /* 右侧留白给浮在输入框内的发送按钮，避免文字压住按钮 */
+    padding: 9px 46px 9px 10px;
     font-family: var(--font-text);
     font-size: var(--font-ui-small);
     line-height: 1.4;
@@ -229,6 +355,35 @@
     /* 聚焦高亮环：明确可输入 + 当前焦点 */
     box-shadow: 0 0 0 2px var(--background-modifier-border);
     outline: none;
+}
+/* 输入框内右下角发送按钮（Phase 8；形状对齐 VSCode .send-fab：30×30、radius 7） */
+.dsh-native-send {
+    position: absolute;
+    right: 12px;
+    bottom: 12px;
+    width: 30px;
+    height: 30px;
+    flex: 0 0 auto;
+    border: none;
+    border-radius: 7px;
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+    font-size: 15px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+    transition: filter 120ms ease, opacity 120ms ease;
+}
+.dsh-native-send:hover:not(.is-disabled) { filter: brightness(1.08); }
+.dsh-native-send.is-disabled {
+    opacity: 0.4;
+    cursor: default;
+    background: var(--background-modifier-border);
+    color: var(--text-muted);
+    box-shadow: none;
 }
 
 /* overlay —— 默认隐藏，仅加 .is-visible 才显示，避免空 overlay 永久盖住界面 */
@@ -251,67 +406,9 @@
 }
 .dsh-native-msg { font-size: var(--font-ui-small); line-height: 1.5; max-width: 90%; }
 
-/* ===== v0.1.5：多标签会话栏 + 历史弹窗 + dsh-ui 卡片 + 思考折叠 + hover 操作 ===== */
-
-/* 头部改为：顶部条（状态/标题/新建/历史）+ 多标签栏 */
-.dsh-native-header {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 4px;
-}
-.dsh-native-header-top {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex: 0 0 auto;
-}
-.dsh-icon-btn {
-    padding: 2px 8px;
-    font-size: var(--font-ui-small);
-    line-height: 1.4;
-}
-.dsh-tabbar {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-wrap: wrap;
-    flex: 0 0 auto;
-    overflow-x: auto;
-}
-.dsh-tab {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    max-width: 160px;
-    padding: 2px 8px;
-    border: 1px solid var(--background-modifier-border);
-    background: var(--background-secondary);
-    border-radius: var(--radius-s);
-    font-size: var(--font-ui-smaller);
-    color: var(--text-muted);
-    cursor: pointer;
-    white-space: nowrap;
-    overflow: hidden;
-}
-.dsh-tab:hover { background: var(--background-modifier-hover); }
-.dsh-tab.is-active {
-    background: var(--background-primary-alt);
-    border-color: var(--interactive-accent);
-    color: var(--text-normal);
-    font-weight: 600;
-}
-.dsh-tab-label {
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.dsh-tab-close {
-    color: var(--text-faint);
-    font-size: 13px;
-    line-height: 1;
-    padding: 0 2px;
-    border-radius: 4px;
-}
-.dsh-tab-close:hover { color: var(--text-error); background: rgba(244,67,54,0.12); }
+/* ===== v0.1.8 起：头部/会话切换对齐 VSCode（标题下拉 + 会话列表） =====
+   旧版多标签栏（dsh-tabbar / dsh-tab / dsh-tab-close / dsh-tab-rename）样式已随
+   main.js 的重构移除；历史弹窗与 dsh-ui 卡片样式保留。 */
 
 /* 思考折叠（<details>） */
 .dsh-thinking {
@@ -344,17 +441,21 @@
 }
 .dsh-msg-assistant:hover .dsh-msg-actions { display: flex; }
 
-/* 修复 Bug 3：用户消息可见性强制 */
+/* 用户消息气泡：对齐 VSCode —— 文本左对齐、右侧留白 12%、信息蓝染色圆角气泡（带蓝边）。
+   染色用 color-mix 基于主题强调色，明暗主题都自适应（不硬编码蓝）。 */
 .dsh-msg-user {
     display: flex !important;
     flex-direction: column;
-    align-items: flex-end; /* 用户消息靠右 */
+    align-items: stretch;
+    margin-left: 12%;
 }
 .dsh-msg-user .dsh-msg-content {
-    background: var(--background-secondary);
-    border: 1px solid var(--background-modifier-border);
-    max-width: 88%;
-    align-self: flex-end;
+    background: color-mix(in srgb, var(--interactive-accent) 12%, var(--background-primary));
+    border: 1px solid var(--interactive-accent);
+    border-radius: var(--radius-m);
+    padding: 8px 12px;
+    max-width: 100%;
+    align-self: auto;
 }
 .dsh-msg-user .dsh-msg-content:empty:not(.dsh-msg-fallback) {
     /* 空内容兜底，避免气泡塌成 0 高度看不见 */
@@ -383,7 +484,8 @@
     color: var(--text-muted);
     line-height: 1.4;
 }
-.dsh-activity.is-active { border-color: var(--interactive-accent); color: var(--text-normal); }
+.dsh-activity.is-active { border-color: var(--interactive-accent); color: var(--text-normal); border-left: 3px solid var(--interactive-accent); background: rgba(var(--interactive-accent-rgb), 0.10); animation: dsh-act-pulse 1.4s ease-in-out infinite; }
+@keyframes dsh-act-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } }
 .dsh-activity.is-done { opacity: 0.75; }
 .dsh-activity-overflow { border-style: dashed; font-style: italic; background: var(--background-secondary); }
 .dsh-activity-icon { flex: 0 0 auto; }
@@ -404,11 +506,7 @@
 }
 .dsh-mini-btn:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
 
-/* steer 模式：输入框青色边（计划待确认信号，对齐 Claudian） */
-.dsh-native-input.is-steer {
-    border-color: #1d9e75;
-    box-shadow: 0 0 0 1px rgba(29,158,117,0.35);
-}
+/* （旧版 steer 青色输入框边已移除：VSCode 无此信号，模式态由 chip-btn.is-on 高亮承担） */
 
 /* 审批卡 extra 字段 */
 .dsh-pending-extra {
@@ -559,4 +657,241 @@
 .dui-note { font-size: var(--font-ui-smaller); color: var(--text-faint); font-style: italic; }
 .dui-divider { border: none; border-top: 1px solid var(--background-modifier-border); margin: 4px 0; }
 .dui-spacer { flex: 0 0 auto; }
+/* dsh-ui 解析占位（流式未完成 / 渲染失败） */
+.dui-pending { padding: 8px 12px; border: 1px dashed var(--interactive-accent); border-radius: var(--radius-s); color: var(--text-muted); font-size: var(--font-ui-small); background: rgba(var(--interactive-accent-rgb), 0.06); animation: dsh-pulse 1.4s ease-in-out infinite; }
+.dui-broken { padding: 8px 12px; border-radius: var(--radius-s); }
+
+/* Phase I：mermaid 流程图 / plot 函数图 本地 SVG 渲染 */
+.dui-mermaid-wrap { color: var(--text-muted); overflow-x: auto; }
+.dui-mermaid-wrap svg { display: block; }
+.dui-mnode { fill: var(--background-secondary); stroke: var(--interactive-accent); stroke-width: 1.4; }
+.dui-mnode-label { fill: var(--text-normal); font-size: 12px; font-family: var(--font-text, sans-serif); }
+.dui-edge-label { fill: var(--text-muted); font-size: 10px; font-family: var(--font-ui, sans-serif); }
+.dui-plot-wrap { color: var(--text-muted); }
+.dui-plot-wrap svg { display: block; border-radius: var(--radius-s); background: var(--background-primary-alt); }
+.dui-plot-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; font-size: var(--font-ui-smaller); color: var(--text-normal); align-items: center; }
+.dui-dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 4px; vertical-align: middle; }
+
+/* Phase 6：附件 chip 容器 + @ 文件补全弹窗 */
+.dsh-native-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0;
+    margin: 0 0 2px 0;
+}
+.dsh-native-refbtn {
+    flex: 0 0 auto;
+    align-self: flex-end;
+    cursor: pointer;
+    background: var(--background-secondary);
+    color: var(--text-normal);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    padding: 6px 10px;
+    font-size: var(--font-ui-small);
+    line-height: 1.3;
+}
+.dsh-native-refbtn:hover { background: var(--background-modifier-hover); }
+.dsh-atchip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 240px;
+    padding: 3px 8px;
+    background: var(--background-modifier-form-field);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    color: var(--text-normal);
+    font-size: var(--font-ui-smaller);
+}
+.dsh-atchip-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dsh-atchip-x {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-weight: 700;
+    line-height: 1;
+    padding: 0 2px;
+}
+.dsh-atchip-x:hover { color: var(--text-error); }
+.dsh-at-popup {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: calc(100% + 4px);
+    max-height: 240px;
+    overflow-y: auto;
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+    z-index: 50;
+    padding: 4px;
+}
+.dsh-at-item {
+    padding: 5px 8px;
+    border-radius: var(--radius-s);
+    font-size: var(--font-ui-small);
+    color: var(--text-normal);
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dsh-at-item.is-active,
+.dsh-at-item:hover { background: var(--background-modifier-hover); color: var(--text-accent); }
+.dsh-at-empty { padding: 6px 8px; color: var(--text-faint); font-size: var(--font-ui-small); }
+@keyframes dsh-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+
+/* ===== Phase B：/ 技能菜单弹窗 ===== */
+.dsh-slash-popup {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: calc(100% + 4px);
+    max-height: 260px;
+    overflow-y: auto;
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+    z-index: 50;
+    padding: 4px;
+}
+.dsh-slash-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px;
+    border-radius: var(--radius-s);
+    font-size: var(--font-ui-small);
+    color: var(--text-normal);
+    cursor: pointer;
+}
+.dsh-slash-item.is-active,
+.dsh-slash-item:hover { background: var(--background-modifier-hover); color: var(--text-accent); }
+.dsh-slash-name { flex: 0 0 auto; font-weight: 600; color: var(--interactive-accent); }
+.dsh-slash-tag {
+    flex: 0 0 auto;
+    font-size: 10px;
+    padding: 0 6px;
+    border-radius: 999px;
+    background: rgba(var(--interactive-accent-rgb), 0.16);
+    color: var(--interactive-accent);
+}
+.dsh-slash-desc {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+.dsh-slash-empty { padding: 6px 8px; color: var(--text-faint); font-size: var(--font-ui-small); }
+
+/* ===== Phase E：Plan 模式横幅 + Todo 进度条（对齐 VSCode plan-strip / todo-strip） ===== */
+/* 容器透明，两个子条各自是通栏横条 */
+.dsh-plan-strip {
+    order: 5;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    padding: 0;
+    margin: 0;
+    border-radius: 0;
+    background: transparent;
+    border: none;
+    font-size: 11.5px;
+}
+/* Plan 横幅：黄色系通栏条（VSCode .plan-strip） */
+.dsh-plan-banner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    color: var(--text-warning, #cca700);
+    background: rgba(204, 167, 0, 0.10);
+    border-top: 1px solid rgba(204, 167, 0, 0.35);
+}
+/* 链接式文字按钮（VSCode .link-btn） */
+.dsh-link-btn {
+    margin-left: auto;
+    cursor: pointer;
+    background: none;
+    border: none;
+    color: var(--text-accent);
+    border-radius: 0;
+    padding: 0 4px;
+    font-size: inherit;
+    line-height: inherit;
+}
+.dsh-link-btn:hover { text-decoration: underline; }
+/* Todo 进度条：灰色通栏条（VSCode .todo-strip） */
+.dsh-todo-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    padding: 4px 12px;
+    border-top: 1px solid var(--background-modifier-border);
+    background: transparent;
+    font-size: 11.5px;
+    color: var(--text-normal);
+}
+.dsh-todo-count { flex: 0 0 auto; font-weight: 600; color: #3794ff; } /* = VSCode charts-blue */
+.dsh-todo-bar {
+    flex: 0 0 90px;
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(128,128,128,0.25);
+    overflow: hidden;
+}
+.dsh-todo-bar-fill { height: 100%; border-radius: 2px; background: #73c991; transition: width .3s ease; } /* = VSCode testing-iconPassed */
+.dsh-todo-cur { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+.dsh-todo-chev { flex: 0 0 auto; color: var(--text-muted); }
+.dsh-todo-list { margin: 2px 0 4px; padding: 0 12px; list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.dsh-todo-item { display: flex; align-items: baseline; gap: 6px; padding: 1px 0; font-size: 11.5px; color: var(--text-muted); }
+.dsh-todo-item.is-completed { color: var(--text-faint); text-decoration: line-through; }
+.dsh-todo-item.is-completed .dsh-todo-mark { color: #73c991; text-decoration: none; }
+.dsh-todo-item.is-in_progress { color: var(--text-normal); font-weight: 500; }
+.dsh-todo-item.is-in_progress .dsh-todo-mark { color: #3794ff; }
+.dsh-todo-mark { flex: 0 0 auto; width: 14px; color: var(--interactive-accent); }
+
+/* ===== Phase F：排队队列条（对齐 VSCode .queue-strip：虚线 chip 横排） ===== */
+.dsh-queue-strip {
+    order: 3;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 4px 8px;
+    margin: 0;
+    border-radius: 0;
+    background: transparent;
+    border-top: 1px solid rgba(128,128,128,0.2);
+    font-size: 11px;
+}
+.dsh-queue-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border: 1px dashed rgba(128,128,128,0.4);
+    border-radius: 10px;
+    padding: 1px 8px;
+    color: var(--text-normal);
+}
+.dsh-queue-pre { flex: none; }
+.dsh-queue-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-queue-rm {
+    cursor: pointer;
+    color: var(--text-muted);
+}
+.dsh-queue-rm:hover { color: var(--text-error); }
 
