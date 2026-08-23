@@ -57,6 +57,7 @@ const DEFAULT_SETTINGS = {
     selectionButton: false, // 框选后显示「发送到 DSH」浮动按钮
     openPanelOnSend: false, // 发送后自动打开/聚焦 DSH 面板
     manualTitles: {}, // 会话手动重命名覆盖表：{ [sessionId]: 自定义标题 }，持久化以跨重启保留
+    autoTitles: {}, // DSH 自动命名的缓存（session.list 不带 title，探测 history 尾页投影后缓存，跨重启保留）
 };
 
 /* ====================================================================
@@ -1301,14 +1302,14 @@ class DshNativeView extends ItemView {
         catch (e) { return fatal("createSpan statusDot", e); }
         // 标题按钮：显示当前会话标题 + 下拉箭头，点击展开会话列表（对齐 VSCode title-btn）
         try {
-            this.titleBtn = headerTop.createEl("button", { cls: "dsh-title-btn", attr: { title: "点击切换会话；双击重命名" } });
+            this.titleBtn = headerTop.createEl("button", { cls: "dsh-title-btn", attr: { title: "点击切换会话" } });
             this.titleBtn.type = "button";
             this.titleText = this.titleBtn.createSpan("dsh-title-text");
             this.titleText.textContent = "—";
             this.titleChev = this.titleBtn.createSpan("dsh-chev");
             this.titleChev.textContent = "⌄";
+            // 仅展开/收起会话列表；重命名只经 ✎ 图标（对齐 VSCode，双击不再触发改名框）
             this.titleBtn.addEventListener("click", () => this.toggleSessionList());
-            this.titleBtn.addEventListener("dblclick", (e) => { e.preventDefault(); this.openRenameBar(); });
         } catch (e) { return fatal("createEl titleBtn", e); }
         // 重命名图标（对齐 VSCode icon-btn mini ✎）
         try {
@@ -1624,6 +1625,7 @@ class DshNativeView extends ItemView {
 
     async loadSessions() {
         this.sessions = await this.api.listSessions(this.workspace.workspaceId);
+        this.applyCachedTitles();
         if (this.sessions.length > 0) {
             this.openTabs = [this.sessions[0].sessionId];
             this.setSession(this.sessions[0].sessionId);
@@ -1635,17 +1637,78 @@ class DshNativeView extends ItemView {
         }
         this.renderSessionList();
         this.updateTitleBtn();
+        void this.enrichSessionsInBackground();
     }
 
-    _tabTitle(s) {
-        // 手动重命名优先（持久化覆盖，跨重启保留）；其次 DSH 标题；最后兜底
+    _resolveTitle(s) {
+        // 手动重命名 > DSH 标题 > 自动命名缓存（探测 history 投影所得，跨重启保留）
         if (s && s.sessionId && this.plugin && this.plugin.settings && this.plugin.settings.manualTitles) {
             const mt = this.plugin.settings.manualTitles[s.sessionId];
             if (mt) return mt;
         }
         if (s && s.title) return s.title;
-        if (s && s.sessionId) return "未命名 · " + s.sessionId.slice(0, 12);
+        if (s && s.sessionId && this.plugin && this.plugin.settings && this.plugin.settings.autoTitles) {
+            const at = this.plugin.settings.autoTitles[s.sessionId];
+            if (at) return at;
+        }
+        return "";
+    }
+
+    _tabTitle(s) {
+        const t = this._resolveTitle(s);
+        if (t) return t;
+        if (s && s.sessionId) return "（未命名会话）"; // 兜底文案对齐 VSCode 会话列表
         return "未命名";
+    }
+
+    // 把缓存的自动命名套到刚拉取的会话行上（对齐 VSCode applyCachedTitles）
+    applyCachedTitles() {
+        const at = (this.plugin && this.plugin.settings && this.plugin.settings.autoTitles) || {};
+        for (const s of this.sessions) {
+            if (s && s.sessionId && !s.title && at[s.sessionId]) s.title = at[s.sessionId];
+        }
+    }
+
+    // session.list 不携带 title（projection-only 域）：后台逐个探测该会话 history 尾页的
+    // title 投影。并发受限、结果写 settings.autoTitles 缓存；学到新名字立即重渲染
+    // （对齐 dsh-vscode manager.enrichTitlesInBackground）
+    async enrichSessionsInBackground() {
+        if (this._enrichInFlight) return;
+        this._enrichInFlight = true;
+        try {
+            const st = this.plugin && this.plugin.settings ? this.plugin.settings : null;
+            if (!st) return;
+            st.autoTitles = st.autoTitles || {};
+            const targets = this.sessions
+                .filter((s) => s.sessionId && !s.title && !(st.manualTitles || {})[s.sessionId] && !st.autoTitles[s.sessionId])
+                .slice(0, 30);
+            if (targets.length === 0) return;
+            let learned = false;
+            let cursor = 0;
+            const worker = async () => {
+                while (cursor < targets.length) {
+                    const row = targets[cursor++];
+                    try {
+                        const h = await this.api.getHistory(row.sessionId, null, 1);
+                        const p = h && h.projections;
+                        const title = p && typeof p === "object" ? ((p.values && p.values.title) ?? p.title) : null;
+                        if (typeof title === "string" && title) {
+                            row.title = title;
+                            st.autoTitles[row.sessionId] = title;
+                            learned = true;
+                        }
+                    } catch (_e) { /* 单个失败忽略 */ }
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(6, targets.length) }, () => worker()));
+            if (learned) {
+                try { await this.plugin.saveSettings(); } catch (_e) {}
+                this.renderSessionList();
+                this.updateTitleBtn();
+            }
+        } finally {
+            this._enrichInFlight = false;
+        }
     }
 
     renderSessionList() {
@@ -1719,10 +1782,12 @@ class DshNativeView extends ItemView {
             const curEntry = this.sessions.find((x) => x.sessionId === this.sessionId);
             this.sessions = listed;
             if (curEntry && !listed.some((x) => x.sessionId === curEntry.sessionId)) this.sessions.unshift(curEntry);
+            this.applyCachedTitles();
         } catch (_e) { /* 刷新失败保留现有列表 */ }
         this.renderSessionList();
         this.updateTitleBtn();
         this.renderPresetPicker();
+        void this.enrichSessionsInBackground();
     }
 
     toggleSessionList(force) {
@@ -1735,7 +1800,9 @@ class DshNativeView extends ItemView {
     updateTitleBtn() {
         if (!this.titleText) return;
         const s = this.sessions.find((x) => x.sessionId === this.sessionId);
-        this.titleText.textContent = s ? this._tabTitle(s) : (this.sessionId ? "未命名" : "—");
+        if (!s) { this.titleText.textContent = this.sessionId ? "新会话" : "—"; return; }
+        const t = this._resolveTitle(s);
+        this.titleText.textContent = t || (s.blank ? "新会话" : "（未命名会话）"); // 对齐 VSCode 标题按钮兜底
     }
 
     // 重命名会话（对齐 VSCode .rename-bar：标题按钮 ✎ / 双击标题 打开输入框，Enter 保存）
@@ -3227,6 +3294,14 @@ class DshNativeView extends ItemView {
                 ? this.plugin.settings.manualTitles[this.sessionId] : null;
             if (s && !override && typeof p.value === "string" && p.value) {
                 s.title = p.value;
+                // DSH 自动命名也进缓存，重启后会话列表仍能显示（手动重命名优先级更高）
+                if (this.plugin && this.plugin.settings) {
+                    this.plugin.settings.autoTitles = this.plugin.settings.autoTitles || {};
+                    if (!this.plugin.settings.autoTitles[this.sessionId]) {
+                        this.plugin.settings.autoTitles[this.sessionId] = p.value;
+                        try { this.plugin.saveSettings(); } catch (_e) {}
+                    }
+                }
                 this.renderSessionList();
                 this.updateTitleBtn();
             }
