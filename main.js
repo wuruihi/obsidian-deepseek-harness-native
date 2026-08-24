@@ -2097,7 +2097,7 @@ class DshNativeView extends ItemView {
         try {
             const wsId = this.workspace && this.workspace.workspaceId;
             const mem = wsId && this.plugin.settings.modelMemory ? this.plugin.settings.modelMemory[wsId] : null;
-            if (!mem || !mem.provider || !mem.model) return;
+            if (!mem || !mem.provider || !mem.model) { return; }
             await this.api.selectModel(sessionId, mem.provider, mem.model);
             this.loadModels(); // 让当前下拉反映应用后的值
         } catch (_e) {
@@ -2305,7 +2305,7 @@ class DshNativeView extends ItemView {
     async switchModel(provider, model, effort) {
         if (!this.sessionId) return;
         try {
-            await this.api.selectModel(this.sessionId, provider, model, effort);
+            const rpcResult = await this.api.selectModel(this.sessionId, provider, model, effort);
             new Notice("已切换模型：" + provider + "/" + model);
             // v0.5.2 对齐：手动切模型 → 记入本工作区记忆（新会话只继承本项目的，不吃宿主全局最近值）
             const wsId = this.workspace && this.workspace.workspaceId;
@@ -2373,6 +2373,10 @@ class DshNativeView extends ItemView {
     clearConversation() {
         this._stopPoll();
         this._turnDone = true; // 切会话即终止上一个 turn 的轮询
+        // 修复：切换/新建会话必须把「运行中」状态连同实时活动条一并归零，
+        // 否则旧会话正在跑的任务会让新会话误显示「正在执行」（运行态属会话内部，不能跨会话泄漏）
+        this._running = false;
+        this.clearLiveBar();
         if (this.messagesEl) this.messagesEl.empty();
         if (this.statusLine) this.statusLine.setText("");
         this.assistantEl = null;
@@ -2832,7 +2836,15 @@ class DshNativeView extends ItemView {
             pre.textContent = text;
         }
         // 渲染完成后再滚到底（仅首屏/实时发送，翻页由 loadHistory 自行控制位置）
-        if (!atTop) this.scrollToBottom();
+        if (!atTop) {
+            // 修复"发送后看不到自己消息"：MarkdownRenderer 异步渲染后布局高度未定，
+            // 同步 scrollToBottom 会读到一个偏小的 scrollHeight，把新气泡压到可视区下方。
+            // 改等一帧布局落地，再用 scrollIntoView 精确把气泡本身顶进视口（兼容嵌套滚动容器）。
+            requestAnimationFrame(() => {
+                try { bubble.scrollIntoView({ block: "end", inline: "nearest" }); } catch (_) {}
+                try { this.scrollToBottom(); } catch (_) {}
+            });
+        }
     }
 
     beginAssistantBubble() {
@@ -4010,7 +4022,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.8-cleanup-diag-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.10-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
