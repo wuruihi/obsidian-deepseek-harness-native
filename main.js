@@ -1067,7 +1067,7 @@ function wrapDshUiJson(text) {
             const partial = text.slice(i);
             if (/"items"/.test(partial)) {
                 const before = out.slice(Math.max(0, out.length - 30));
-                if (/```dsh-ui\s*$/i.test(before)) {
+                if (/`{3,}dsh-ui\s*$/i.test(before)) {
                     out += partial;
                 } else {
                     out += "```dsh-ui\n" + partial + "\n```";
@@ -1080,9 +1080,9 @@ function wrapDshUiJson(text) {
             continue;
         }
         const candidate = text.slice(i, j);
-        // 解析试一下
+        // 解析试一下（v0.1.12：lenientJsonParse 兜底处理未转义引号）
         let spec = null;
-        try { spec = JSON.parse(candidate); } catch (_e) { spec = null; }
+        try { spec = JSON.parse(candidate); } catch (_e) { spec = lenientJsonParse(candidate); }
         const isDshUi = spec
             && typeof spec === "object"
             && Array.isArray(spec.items)
@@ -1113,6 +1113,17 @@ function wrapDshUiJson(text) {
 // 智能引号 → 直引号；删除 ] / } 前的尾随逗号
 function cheapRepairs(s) {
     return s.replace(/[\u201c\u201d]/g, '"').replace(/[\u2018\u2019]/g, "'").replace(/,\s*([}\]])/g, "$1");
+}
+// 兜底：剥离文本首尾的 markdown 围栏标记（```dsh-ui / ``` / ````dsh-ui 等），
+// 用于 postProcessDshUi / renderDshUiSegment 中，防止残留围栏行导致 JSON.parse 失败。
+function stripFenceMarkers(text) {
+    if (!text) return text;
+    let s = text.trim();
+    // 去掉首行的开栏符（3+ 反引号 + 可选语言标签）
+    s = s.replace(/^`{3,}[^\n]*\n?/, "");
+    // 去掉末行的闭合栏（3+ 反引号）
+    s = s.replace(/\n?`{3,}\s*$/, "");
+    return s.trim();
 }
 // 括号平衡修复（对齐 VSCode dshui.tsx balanceClose，v0.4.11）：
 // `}` 到来时栈顶是 `[`（合法 JSON 不可能的形态——模型提前闭 root 漏关 items）→ 补 `]`；
@@ -1157,13 +1168,23 @@ function balanceClose(s) {
 // 从 start 扫描一个完整 JSON 值，返回 [endIndex, value] 或 null（尊重字符串/转义/嵌套括号）。
 // endIndex 越过闭合符（对齐 VSCode scanValue 的 k+1 语义——调用方要从该处继续扫孤儿值）。
 // 平衡但非法（如 items [ 被 root 提前闭合卡住）时先用 balanceClose 修一轮再放弃（v0.4.11）。
+// v0.1.12 本质修复：对齐 VSCode scanValue——只追踪匹配的括号对（{→} 或 [→]），
+// 忽略另一种括号。原实现把 {/[ 都 depth++、}/] 都 depth--，混合计数导致畸形 JSON
+// （rows 数组漏闭合 } 提前关 table）时平衡终点算到文件末尾，切片含 callout+尾巴，
+// balanceClose 遇空栈 ] 返回 null → repairSpec 整体失败。
 function scanJsonValue(text, start) {
     let i = start;
     const n = text.length;
     while (i < n && /\s/.test(text[i])) i++;
     if (i >= n) return null;
-    const ch = text[i];
-    if (ch !== "{" && ch !== "[") return null;
+    const open = text[i];
+    const close = open === "{" ? "}" : open === "[" ? "]" : null;
+    if (!close) {
+        // 非括号值（数字/字符串/布尔/null）：扫到分隔符为止
+        let j = i;
+        while (j < n && !",]}".includes(text[j])) j++;
+        try { return [j, JSON.parse(text.slice(i, j).trim())]; } catch (_e) { return null; }
+    }
     let depth = 0;
     let inStr = false;
     let esc = false;
@@ -1173,8 +1194,8 @@ function scanJsonValue(text, start) {
         if (c === "\\") { esc = true; continue; }
         if (c === '"') { inStr = !inStr; continue; }
         if (inStr) continue;
-        if (c === "{" || c === "[") depth++;
-        else if (c === "}" || c === "]") {
+        if (c === open) depth++;
+        else if (c === close) {
             depth--;
             if (depth === 0) {
                 const slice = text.slice(i, j + 1);
@@ -1236,6 +1257,143 @@ function repairSpec(raw) {
     if (orphans.length > 0) root.items = [...root.items, ...orphans];
     return root;
 }
+// v0.1.12 宽松 JSON 解析器：处理 LLM 输出中字符串值内含未转义双引号的情况。
+// 启发式：在字符串内遇到 " 时，看下一个非空白字符是否为 JSON 分隔符（, : } ]）或结束。
+// 是 → 视为字符串闭合引号；否 → 视为字符串内容中的字面引号，转义为 \"。
+// 这是 VSCode/DSH 网页版能正常渲染而 Obsidian 版不能的本质差异——它们的 markdown 渲染器
+// 提取完整围栏内容后，有类似的宽松解析兜底；Obsidian 版原 parseSpec 全链路依赖 inStr 状态机，
+// 被未转义引号搞乱后所有修复策略（cheapRepairs/balanceClose/repairSpec/scanJsonValue）全部失效。
+function lenientJsonParse(s) {
+    if (typeof s !== "string") return null;
+    let out = "";
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (esc) { out += ch; esc = false; continue; }
+        if (ch === "\\") { out += ch; esc = true; continue; }
+        if (ch === '"') {
+            if (!inStr) {
+                inStr = true;
+                out += ch;
+            } else {
+                // 潜在闭合引号：向后跳过空白，看下一个字符
+                let j = i + 1;
+                while (j < s.length && /\s/.test(s[j])) j++;
+                const next = s[j];
+                if (next === undefined || next === "," || next === ":" || next === "}" || next === "]") {
+                    inStr = false;
+                    out += ch;
+                } else {
+                    // 未转义引号在字符串内部 → 转义
+                    out += '\\"';
+                }
+            }
+            continue;
+        }
+        out += ch;
+    }
+    if (inStr) return null; // 字符串未闭合，放弃
+    try { return JSON.parse(out); } catch (_e) { return null; }
+}
+// v0.1.12 移植自 VSCode dshui.tsx wrapBareMembers：
+// 修复数组内裸 key/value 对（模型漏写元素的 {）：如 [{callout},"type":"table","rows":[…]]
+// 合法 JSON 中数组元素不会是 "key":value 对，所以元素位置出现字符串后跟 : 是明确的畸形信号。
+function wrapBareMembers(s) {
+    let out = "";
+    let i = 0;
+    let fixed = 0;
+    const stack = []; // "a"=array, "o"=object, "p"=pseudo-object (we opened it)
+    let expect = "elem"; // elem|value|key|sep
+    const top = () => stack[stack.length - 1];
+    const readString = (from) => {
+        let j = from + 1;
+        while (j < s.length) {
+            if (s[j] === "\\") j += 2;
+            else if (s[j] === '"') break;
+            else j++;
+        }
+        return [s.slice(from, j + 1), j + 1];
+    };
+    while (i < s.length) {
+        while (i < s.length && /\s/.test(s[i])) { out += s[i]; i++; }
+        if (i >= s.length) break;
+        const ch = s[i];
+        if (ch === '"') {
+            const [tok, after] = readString(i);
+            let k = after;
+            while (k < s.length && /\s/.test(s[k])) k++;
+            const isKey = k < s.length && s[k] === ":";
+            if (expect === "elem" && isKey) {
+                out += "{" + tok + ":";
+                stack.push("p");
+                fixed++;
+                expect = "value";
+                i = k + 1;
+                continue;
+            }
+            if (!isKey && (expect === "elem" || expect === "value")) {
+                out += tok;
+                i = after;
+                expect = "sep";
+                continue;
+            }
+            if (expect === "key" && isKey) {
+                out += tok + ":";
+                expect = "value";
+                i = k + 1;
+                continue;
+            }
+            return null;
+        }
+        if (ch === "{" || ch === "[") {
+            if (expect === "key") return null;
+            stack.push(ch === "{" ? "o" : "a");
+            out += ch;
+            i++;
+            expect = ch === "{" ? "key" : "elem";
+            continue;
+        }
+        if (ch === "}" || ch === "]") {
+            if (top() === "p") { out += "}"; stack.pop(); continue; }
+            const want = ch === "}" ? "o" : "a";
+            if (top() === want) { stack.pop(); out += ch; i++; expect = "sep"; continue; }
+            if (stack.length === 0 && expect === "sep") { out += ch; i++; continue; }
+            return null;
+        }
+        if (ch === ",") {
+            if (top() === "p") {
+                let k = i + 1;
+                while (k < s.length && /\s/.test(s[k])) k++;
+                if (k < s.length && s[k] === '"') {
+                    const [, after] = readString(k);
+                    let m = after;
+                    while (m < s.length && /\s/.test(s[m])) m++;
+                    if (m < s.length && s[m] === ":") {
+                        out += ","; expect = "key"; i = k; continue;
+                    }
+                }
+                out += "}"; stack.pop(); out += ","; expect = "elem"; i++; continue;
+            }
+            out += ",";
+            expect = top() === "a" ? "elem" : "key";
+            i++;
+            continue;
+        }
+        if (expect === "value" || expect === "elem") {
+            let j = i;
+            while (j < s.length && !",]}".includes(s[j])) j++;
+            out += s.slice(i, j);
+            i = j;
+            expect = "sep";
+            continue;
+        }
+        return null;
+    }
+    if (top() === "p") { out += "}"; stack.pop(); }
+    if (stack.length > 0) return null;
+    return fixed > 0 ? out : null;
+}
 function parseSpec(raw) {
     if (typeof raw !== "string") return null;
     // v0.4.12 对齐：裸数组 / 单个裸组件在任意层级解析成功后都包壳成 {items:[…]}，
@@ -1248,6 +1406,16 @@ function parseSpec(raw) {
     try { const v = JSON.parse(raw); return v && typeof v === "object" ? norm(v) : null; } catch (_e) {}
     const cheap = cheapRepairs(raw);
     try { const v = JSON.parse(cheap); return v && typeof v === "object" ? norm(v) : null; } catch (_e) {}
+    // v0.1.12：宽松解析——处理字符串值内未转义双引号（LLM 常见输出缺陷）
+    const lenient = lenientJsonParse(cheap);
+    if (lenient && typeof lenient === "object") return norm(lenient);
+    // v0.1.12：移植自 VSCode——数组内裸 key/value 对（模型漏写元素的 {）
+    const wrapped = wrapBareMembers(cheap);
+    if (wrapped) {
+        try { const v = JSON.parse(wrapped); if (v && typeof v === "object") return norm(v); } catch (_e) {}
+        const wl = lenientJsonParse(wrapped);
+        if (wl && typeof wl === "object") return norm(wl);
+    }
     // 截断尾巴：栏落定时容器还开着 → 自动闭合再试（v0.4.11）
     const closed = balanceClose(cheap);
     if (closed) {
@@ -1289,53 +1457,80 @@ function balancedEnd(s, pos) {
     return -1;
 }
 /** 把助手文本切成 {kind:"text"|"fence", text} 段；fence 段是裸 spec 文本 */
+// v0.1.12 本质重写：逐行扫描围栏结构（开栏行→收集内容行→闭合栏行），
+// 完全不依赖 JSON 括号平衡。原实现用 balancedEnd（inStr 状态机）切分，
+// LLM 输出的 JSON 字符串值里常有未转义双引号（如 你没有被"AI 漏一整章"坑过），
+// 会搞乱 inStr 状态机，在错误位置找到括号平衡、把 JSON 截断为 517/626 字符导致 parseSpec 失败。
+// 闭合围栏（行首 3+ 反引号）是可靠的结构边界，不受 JSON 内部内容影响——这也是 VSCode/DSH 网页版的做法。
 function splitDshUiSegments(text) {
-    if (!text.includes("```dsh-ui")) return [{ kind: "text", text }];
+    const openerRe = /(`{3,})\s*dsh-ui\b/i;
+    if (!openerRe.test(text)) return [{ kind: "text", text }];
     const lines = text.split("\n");
-    // 找普通围栏之外的第一个 dsh-ui 开栏符
+    const segs = [];
+    let proseBuf = [];
     let inPlainFence = false;
-    let openerLine = -1;
-    let prosePrefix = [];
-    for (let li = 0; li < lines.length; li++) {
-        const line = lines[li];
+    let plainFenceTicks = 0;
+    let i = 0;
+    const flushProse = () => {
+        if (proseBuf.length > 0) {
+            segs.push({ kind: "text", text: proseBuf.join("\n") });
+            proseBuf = [];
+        }
+    };
+    while (i < lines.length) {
+        const line = lines[i];
         if (inPlainFence) {
-            if (/^\s*```/.test(line)) inPlainFence = false;
+            proseBuf.push(line);
+            const closeMatch = /^\s*(`{3,})/.exec(line);
+            if (closeMatch && closeMatch[1].length >= plainFenceTicks) inPlainFence = false;
+            i++;
             continue;
         }
-        const hit = line.indexOf("```dsh-ui");
-        if (hit >= 0) {
-            openerLine = li;
-            const prefix = line.slice(0, hit);
-            if (prefix.trim()) prosePrefix.push(prefix);
-            break;
+        const hit = openerRe.exec(line);
+        if (hit) {
+            const openerTicks = hit[1].length;
+            const prefix = line.slice(0, hit.index);
+            if (prefix.trim()) proseBuf.push(prefix);
+            flushProse();
+            i++; // 跳过开栏行
+            const fenceLines = [];
+            let foundClose = false;
+            while (i < lines.length) {
+                const fline = lines[i];
+                // 闭合围栏：行首可选空白 + 与开栏相同或更多的反引号。
+                // 宽松匹配（不要求行尾空白/结束），兼容 LLM 输出的非标准闭合栏（如 ``` 后带语言标签）。
+                const closeMatch = /^\s*(`{3,})/.exec(fline);
+                if (closeMatch && closeMatch[1].length >= openerTicks) {
+                    foundClose = true;
+                    i++; // 跳过闭合行
+                    break;
+                }
+                fenceLines.push(fline);
+                i++;
+            }
+            const fenceText = fenceLines.join("\n");
+            const start = specStart(fenceText, 0);
+            if (start >= 0) {
+                segs.push({ kind: "fence", text: fenceText.slice(start).trim() });
+            } else {
+                // 开栏后没有 JSON（空栏/纯文本）：当正文处理
+                if (fenceText.trim()) segs.push({ kind: "text", text: fenceText });
+            }
+            // 未找到闭合栏：流式半截，剩余内容全归当前 fence（已在 fenceLines 中）
+            if (!foundClose) break;
+            continue;
         }
-        if (/^\s*```/.test(line)) inPlainFence = true;
-        else prosePrefix.push(line);
+        // 普通代码围栏（记录反引号数量，避免其内部的 ```dsh-ui 误触发）
+        const plainMatch = /^\s*(`{3,})/.exec(line);
+        if (plainMatch) {
+            inPlainFence = true;
+            plainFenceTicks = plainMatch[1].length;
+        }
+        proseBuf.push(line);
+        i++;
     }
-    if (openerLine < 0) return [{ kind: "text", text }];
-    const segs = [];
-    if (prosePrefix.length > 0) segs.push({ kind: "text", text: prosePrefix.join("\n") });
-    const rest = lines.slice(openerLine + 1).join("\n");
-    const start = specStart(rest, 0);
-    if (start < 0) {
-        // 开栏符后面根本没有 JSON：整行当正文
-        const rebuilt = [...prosePrefix, lines[openerLine], ...lines.slice(openerLine + 1)].join("\n");
-        return [{ kind: "text", text: rebuilt }];
-    }
-    const end = balancedEnd(rest, start);
-    if (end < 0) {
-        // 永不平衡：流式半截或被截断——其余全归 fence（由占位/修复层接管）
-        segs.push({ kind: "fence", text: rest.slice(start) });
-        return segs;
-    }
-    segs.push({ kind: "fence", text: rest.slice(start, end) });
-    // 平衡点之后：吃掉一个紧随的闭合栏（若有），再递归处理余下文本（嵌套普通围栏状态才正确）
-    let tail = rest.slice(end);
-    const tm = /^[ \t]*\r?\n?[ \t]*```[^\n]*\n?/.exec(tail);
-    if (tm) tail = tail.slice(tm[0].length);
-    else tail = tail.replace(/^([ \t]*)```/, "$1"); // 同行闭合：`} ``` `
-    const tailSegs = tail.trim() ? splitDshUiSegments(tail) : [];
-    return [...segs, ...tailSegs];
+    flushProse();
+    return segs.length > 0 ? segs : [{ kind: "text", text }];
 }
 /* ==== FENCE-PURE-END ==== */
 
@@ -2955,9 +3150,26 @@ class DshNativeView extends ItemView {
         if (!row) {
             row = {};
             row.root = this._activityHolder.createDiv("dsh-activity is-active");
-            row.icon = row.root.createSpan("dsh-activity-icon"); row.icon.textContent = "⏳";
-            row.text = row.root.createSpan("dsh-activity-text"); row.text.textContent = label;
-            row.detail = row.root.createSpan("dsh-activity-detail");
+            // 头部行（可点击展开）
+            row.head = row.root.createDiv("dsh-activity-head");
+            row.icon = row.head.createSpan("dsh-activity-icon"); row.icon.textContent = "⏳";
+            row.text = row.head.createSpan("dsh-activity-text"); row.text.textContent = label;
+            row.detail = row.head.createSpan("dsh-activity-detail");
+            row.chev = row.head.createSpan("dsh-activity-chev");
+            row.chev.textContent = "▸";
+            // 展开体（args / result），默认隐藏
+            row.body = row.root.createDiv("dsh-activity-body");
+            row.body.style.display = "none";
+            row._args = null;
+            row._result = null;
+            row._open = false;
+            // 点击头部切换展开
+            row.head.addEventListener("click", () => {
+                row._open = !row._open;
+                row.body.style.display = row._open ? "" : "none";
+                row.chev.textContent = row._open ? "▾" : "▸";
+                if (row._open) this._renderActivityBody(row);
+            });
             this._activities.set(id, row);
         }
         if (finished && !row.finished) {
@@ -2965,17 +3177,25 @@ class DshNativeView extends ItemView {
             row.root.removeClass("is-active"); row.root.addClass("is-done");
             row.finished = true;
             try {
-                const preview = data.result
-                    ? String(typeof data.result === "string" ? data.result : JSON.stringify(data.result)).slice(0, 200)
-                    : (data.error ? ("出错：" + String(data.error).slice(0, 200)) : "");
-                if (preview) row.detail.textContent = " — " + preview;
+                if (data.result != null) {
+                    row._result = typeof data.result === "string" ? data.result : JSON.stringify(data.result, null, 2);
+                    const preview = row._result.slice(0, 200);
+                    if (preview) row.detail.textContent = " — " + preview.replace(/\s+/g, " ");
+                } else if (data.error) {
+                    row._result = "出错：" + String(data.error);
+                    row.detail.textContent = " — " + row._result.slice(0, 200);
+                }
             } catch (_e) { /* 忽略序列化失败 */ }
+            if (row._open) this._renderActivityBody(row);
             // 所有活动都完成后清除 live 指示条
             if (!this._hasRunningActivity()) this.clearLiveBar();
         } else if (!finished) {
             if (data.args || data.input) {
                 const a = data.args || data.input;
-                try { row.detail.textContent = " — " + (typeof a === "string" ? a : JSON.stringify(a)).slice(0, 200); }
+                try {
+                    row._args = typeof a === "string" ? a : JSON.stringify(a, null, 2);
+                    row.detail.textContent = " — " + row._args.replace(/\s+/g, " ").slice(0, 200);
+                }
                 catch (_e) { row.detail.textContent = ""; }
             } else if (data.progress) {
                 row.detail.textContent = " — " + String(data.progress).slice(0, 200);
@@ -2984,6 +3204,26 @@ class DshNativeView extends ItemView {
             this.setLiveBar(label);
         }
         this.scrollToBottom();
+    }
+    // 渲染活动卡片展开体：args + result（对齐 VSCode ActivityCard 的 args/resultPreview）
+    _renderActivityBody(row) {
+        if (!row || !row.body) return;
+        row.body.empty();
+        if (row._args) {
+            const lbl = row.body.createDiv("dsh-activity-body-label");
+            lbl.textContent = "参数";
+            const pre = row.body.createEl("pre", { cls: "dsh-activity-body-pre" });
+            pre.textContent = row._args;
+        }
+        if (row._result) {
+            const lbl = row.body.createDiv("dsh-activity-body-label");
+            lbl.textContent = "结果";
+            const pre = row.body.createEl("pre", { cls: "dsh-activity-body-pre" });
+            pre.textContent = row._result;
+        }
+        if (!row._args && !row._result) {
+            row.body.createDiv("dsh-activity-body-empty").textContent = "（无详情）";
+        }
     }
 
     scheduleRender() {
@@ -2996,7 +3236,9 @@ class DshNativeView extends ItemView {
     }
 
     // 把「思考 + 正文」渲染进指定 content 元素（实时气泡与历史气泡共用）
-    async renderThinkingAndText(contentEl, text, thinking) {
+    // done：true=历史/已结束消息（解析失败显示「渲染失败」），false=流式进行中（显示「生成中」）
+    async renderThinkingAndText(contentEl, text, thinking, done) {
+        if (done === undefined) done = !!this._turnDone;
         contentEl.empty();
         // 思考折叠（<details>），对齐 VSCode DSH 的 thinking 折叠
         if (thinking) {
@@ -3008,21 +3250,81 @@ class DshNativeView extends ItemView {
                 sum.textContent = "💭 思考过程";
                 const tw = det.createDiv("dsh-thinking-body");
                 await MarkdownRenderer.render(this.app, cleanThinking, tw, "", this);
-                this.postProcessDshUi(tw);
+                this.postProcessDshUi(tw, done);
             }
         }
         const body = contentEl.createDiv("dsh-msg-md");
-        // 修复 Bug 1 + Bug 2：渲染前先剥系统上下文、把裸 JSON 包进 dsh-ui 代码块
-        const cleaned = preprocessAssistantText(text || "");
-        await MarkdownRenderer.render(this.app, cleaned, body, "", this);
-        this.postProcessDshUi(body);
+        // 核心修复：dsh-ui 段直接渲染，绕过 MarkdownRenderer（避免代码块被语法高亮/转义破坏）
+        const s = stripSystemContext(text || "");
+        const segs = splitDshUiSegments(s);
+        for (const seg of segs) {
+            if (seg.kind === "fence") {
+                this.renderDshUiSegment(body, seg.text, done);
+            } else {
+                // 纯文本段：仍走 MarkdownRenderer + postProcessDshUi（兜底裸 JSON）
+                const wrapped = wrapDshUiJson(seg.text);
+                const segDiv = body.createDiv();
+                await MarkdownRenderer.render(this.app, wrapped, segDiv, "", this);
+                this.postProcessDshUi(segDiv, done);
+            }
+        }
         // 修复 Bug 1：若清洗后整段都是系统块（DSH 注入空 turn），隐藏内容元素，避免留空气泡
-        if (text && !cleaned.trim()) contentEl.style.display = "none";
+        if (text && !s.trim()) contentEl.style.display = "none";
         else contentEl.style.display = "";
+    }
+    // dsh-ui fence 段直接渲染：parseSpec → dshUiRenderSpec，不经 MarkdownRenderer
+    // 这是修复「组件渲染失败无法解析 JSON」的核心：原管道把 spec 包进 ```dsh-ui 再让
+    // MarkdownRenderer 渲染，代码块可能被语法高亮/实体转义破坏；这里从原始文本直出。
+    renderDshUiSegment(container, specText, done) {
+        // 兜底剥离残留围栏标记（```dsh-ui / ``` 等），再 trim
+        const raw = stripFenceMarkers(specText || "");
+        const spec = parseSpec(raw);
+        if (spec && Array.isArray(spec.items)) {
+            let html;
+            try { html = dshUiRenderSpec(spec); } catch (_e) { return; }
+            const wrap = document.createElement("div");
+            wrap.innerHTML = html;
+            container.appendChild(wrap);
+            return;
+        }
+        // 解析失败：流式进行中 → 占位；已结束 → 失败提示 + 原始折叠
+        if (done) {
+            // v0.1.12 精准诊断：输出 JSON.parse 的具体错误位置
+            try {
+                JSON.parse(raw);
+                console.warn("[dsh-ui PARSE FAIL] JSON.parse succeeded but parseSpec returned null! raw=" + JSON.stringify(raw));
+            } catch (e) {
+                const m = String(e.message).match(/position (\d+)/);
+                const pos = m ? parseInt(m[1]) : -1;
+                const ctx = pos >= 0 ? JSON.stringify(raw.slice(Math.max(0, pos-30), pos+30)) : "(no pos)";
+                console.warn("[dsh-ui PARSE FAIL] len=" + raw.length + " err=" + e.message + " at pos=" + pos + " ctx=" + ctx);
+            }
+        }
+        const wrap = document.createElement("div");
+        wrap.className = "dui " + (done ? "dui-broken" : "dui-pending");
+        if (done) {
+            const callout = document.createElement("div");
+            callout.className = "dui-callout dui-callout-warning";
+            callout.textContent = "⚠️ 组件渲染失败（JSON 无法解析）";
+            const details = document.createElement("details");
+            const sum = document.createElement("summary");
+            sum.className = "muted";
+            sum.textContent = "原始内容";
+            const pre2 = document.createElement("pre");
+            pre2.className = "code-block";
+            pre2.textContent = raw;
+            details.appendChild(sum);
+            details.appendChild(pre2);
+            wrap.appendChild(callout);
+            wrap.appendChild(details);
+        } else {
+            wrap.textContent = "⚙️ 组件生成中…";
+        }
+        container.appendChild(wrap);
     }
     async renderAssistantNow() {
         if (!this.assistantContent) return;
-        await this.renderThinkingAndText(this.assistantContent, this.assistantMd, this.thinkingMd);
+        await this.renderThinkingAndText(this.assistantContent, this.assistantMd, this.thinkingMd, this._turnDone);
         this.scrollToBottom();
     }
     // 历史会话里的单条助手回复（静态，不占用 this.assistantEl）
@@ -3030,20 +3332,24 @@ class DshNativeView extends ItemView {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-assistant");
         bubble.createDiv("dsh-msg-role").textContent = "DSH";
         const content = bubble.createDiv("dsh-msg-content");
-        this.renderThinkingAndText(content, text, thinking);
+        this.renderThinkingAndText(content, text, thinking, true);
         if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
         // 注意：滚动由 loadHistory 控制（首屏到底 / 翻页保持位置），此处不自动滚
     }
 
     // 把 Obsidian 渲染后的 <pre><code class="language-dsh-ui"> 替换成 dsh-ui 富卡片。
-    // 解析失败（流式未完成 / 畸形）时：turn 进行中显示「⚙️ 组件生成中…」，已结束显示「⚠️ 渲染失败」+ 原始折叠。
-    postProcessDshUi(el) {
+    // 仅用于纯文本段中的裸 JSON 兜底（fence 段已由 renderDshUiSegment 直出）。
+    // done：true=已结束（失败显示错误），false=流式中（失败显示占位）。
+    postProcessDshUi(el, done) {
         if (!el || !el.querySelectorAll) return;
-        el.querySelectorAll("pre").forEach((pre) => {
+        if (done === undefined) done = !!this._turnDone;
+        const pres = el.querySelectorAll("pre");
+        pres.forEach((pre) => {
             const code = pre.querySelector("code");
             if (!code) return;
             const cls = (code.className || "") + " " + (code.getAttribute("data-language") || "") + " " + (code.getAttribute("lang") || "");
-            const text = (code.textContent || "").trim();
+            // 兜底剥离残留围栏标记，再 trim
+            const text = stripFenceMarkers(code.textContent || "");
             const isDshUi = /dsh-ui/i.test(cls);
             // 裸数组/裸组件序列形态（v0.4.12）以 [ 开头，也要进解析
             const looksLikeSpec = (text.startsWith("{") || text.startsWith("[")) && (text.includes('"items"') || text.includes('"type"') || text.includes('"title"'));
@@ -3059,7 +3365,9 @@ class DshNativeView extends ItemView {
                 return;
             }
             // 解析失败：占位处理
-            const done = !!this._turnDone;
+            if (done) {
+                try { console.warn("[dsh-ui PARSE FAIL postProcess] isDshUi=" + isDshUi + " len=" + text.length + " raw=" + JSON.stringify(text)); } catch (_e) {}
+            }
             const wrap = document.createElement("div");
             wrap.className = "dui " + (done ? "dui-broken" : "dui-pending");
             if (done) {
@@ -3698,7 +4006,7 @@ class DshNativeView extends ItemView {
                 }
                 const actions = card.createDiv("dsh-pending-actions");
                 const allowBtn = actions.createEl("button", { cls: "dsh-btn mod-cta" });
-                allowBtn.textContent = "允许";
+                allowBtn.textContent = "允许一次";
                 allowBtn.addEventListener("click", () => {
                     this.answerApproval(key, "allowed");
                 });
@@ -3708,15 +4016,62 @@ class DshNativeView extends ItemView {
                     this.answerApproval(key, "rejected");
                 });
             } else {
+                // 提问卡片：对齐 VSCode QuestionCardView，支持单选/多选选项 + 自定义回答
                 const qTitleEl = card.createDiv("dsh-pending-title");
                 qTitleEl.textContent = "❓ DSH 提问";
-                const questions = (entry.questions || []).map((q) => (typeof q === "string" ? q : q.label || q.question || JSON.stringify(q)));
-                const input = card.createEl("textarea", { cls: "dsh-native-input", placeholder: questions.join("\n") });
+                const questions = entry.questions || [];
+                // 每个问题的答案收集：{ [index]: { selected: Set, custom: string } }
+                const answers = {};
+                questions.forEach((q, qi) => {
+                    const qObj = typeof q === "string" ? { question: q } : q;
+                    const label = qObj.label || qObj.question || qObj.text || JSON.stringify(q);
+                    const opts = Array.isArray(qObj.options) ? qObj.options : [];
+                    const multi = !!qObj.multi;
+                    const qWrap = card.createDiv("dsh-question-item");
+                    const qLabel = qWrap.createDiv("dsh-question-label");
+                    qLabel.textContent = (qi + 1) + ". " + label;
+                    answers[qi] = { selected: new Set(), custom: "" };
+                    if (opts.length) {
+                        const optGroup = qWrap.createDiv("dsh-question-options");
+                        opts.forEach((opt, oi) => {
+                            const optLabel = typeof opt === "string" ? opt : (opt.label || opt.value || String(opt));
+                            const optVal = typeof opt === "string" ? opt : (opt.value || opt.label || String(opt));
+                            const row = optGroup.createDiv("dsh-question-option");
+                            const cb = row.createEl("input", {
+                                attr: { type: multi ? "checkbox" : "radio", name: "q" + qi, value: optVal }
+                            });
+                            cb.addEventListener("change", () => {
+                                if (multi) {
+                                    if (cb.checked) answers[qi].selected.add(optVal);
+                                    else answers[qi].selected.delete(optVal);
+                                } else {
+                                    answers[qi].selected.clear();
+                                    if (cb.checked) answers[qi].selected.add(optVal);
+                                }
+                            });
+                            const span = row.createSpan("dsh-question-option-text");
+                            span.textContent = optLabel;
+                            span.addEventListener("click", () => { cb.click(); });
+                        });
+                    }
+                    // 自定义回答输入
+                    const customInput = qWrap.createEl("input", {
+                        cls: "dsh-native-input dsh-question-custom",
+                        attr: { type: "text", placeholder: "或输入自定义回答…" }
+                    });
+                    customInput.addEventListener("input", () => { answers[qi].custom = customInput.value; });
+                });
                 const actions = card.createDiv("dsh-pending-actions");
                 const ansBtn = actions.createEl("button", { cls: "dsh-btn mod-cta" });
                 ansBtn.textContent = "回答";
                 ansBtn.addEventListener("click", () => {
-                    this.answerQuestion(key, input.value);
+                    // 组装答案：优先自定义回答，否则选选项
+                    const finalAnswers = questions.map((q, qi) => {
+                        const a = answers[qi];
+                        if (a.custom) return a.custom;
+                        return Array.from(a.selected).join(", ");
+                    });
+                    this.answerQuestion(key, finalAnswers);
                 });
             }
             this.scrollToBottom();
@@ -3739,14 +4094,15 @@ class DshNativeView extends ItemView {
         this.clearPending(key);
     }
 
-    async answerQuestion(key, text) {
+    async answerQuestion(key, answers) {
         const entry = this.pending.get(key);
         if (!entry) return;
-        const answers = (entry.questions || []).map(() => text);
+        // answers 可以是字符串（旧格式）或字符串数组（新格式，每个问题一个答案）
+        const ansArr = Array.isArray(answers) ? answers : (entry.questions || []).map(() => answers);
         try {
             await this.api.respond(entry.rpcId, {
                 sessionId: this.sessionId,
-                answer: { answers },
+                answer: { answers: ansArr },
             });
         } catch (e) {
             new Notice("回答失败：" + e.message);
@@ -4022,7 +4378,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.10-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.12-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(

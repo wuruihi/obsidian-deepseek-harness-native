@@ -473,9 +473,8 @@ select.dsh-chip-btn { max-width: 220px; }
 }
 .dsh-activity {
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
+    flex-direction: column;
+    gap: 0;
     padding: 4px 8px;
     border-radius: var(--radius-s);
     background: var(--background-secondary);
@@ -484,10 +483,43 @@ select.dsh-chip-btn { max-width: 220px; }
     color: var(--text-muted);
     line-height: 1.4;
 }
+.dsh-activity-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    flex-wrap: wrap;
+}
+.dsh-activity-chev { flex: 0 0 auto; color: var(--text-faint); font-size: 10px; width: 10px; text-align: center; }
+.dsh-activity-body {
+    margin-top: 4px;
+    padding: 6px 8px;
+    background: var(--background-primary-alt);
+    border-radius: var(--radius-s);
+    border: 1px solid var(--background-modifier-border);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.dsh-activity-body-label { font-size: 10px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+.dsh-activity-body-pre {
+    margin: 0;
+    padding: 4px 6px;
+    background: var(--code-background);
+    border-radius: 4px;
+    font-family: var(--font-monospace, monospace);
+    font-size: 11px;
+    color: var(--text-normal);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 200px;
+    overflow-y: auto;
+}
+.dsh-activity-body-empty { font-size: 11px; color: var(--text-faint); font-style: italic; }
 .dsh-activity.is-active { border-color: var(--interactive-accent); color: var(--text-normal); border-left: 3px solid var(--interactive-accent); background: rgba(var(--interactive-accent-rgb), 0.10); animation: dsh-act-pulse 1.4s ease-in-out infinite; }
 @keyframes dsh-act-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } }
 .dsh-activity.is-done { opacity: 0.75; }
-.dsh-activity-overflow { border-style: dashed; font-style: italic; background: var(--background-secondary); }
+.dsh-activity-overflow { border-style: dashed; font-style: italic; background: var(--background-secondary); flex-direction: row; flex-wrap: wrap; align-items: center; }
 .dsh-activity-icon { flex: 0 0 auto; }
 .dsh-activity-text { font-weight: 600; }
 .dsh-activity-detail {
@@ -523,6 +555,41 @@ select.dsh-chip-btn { max-width: 220px; }
     color: var(--text-normal);
     font-family: var(--font-monospace, monospace);
     overflow-wrap: anywhere;
+}
+/* 提问卡片：选项列表 + 自定义输入（对齐 VSCode QuestionCardView） */
+.dsh-question-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 4px 0;
+    border-top: 1px dashed var(--background-modifier-border);
+}
+.dsh-question-item:first-child { border-top: none; }
+.dsh-question-label { font-size: var(--font-ui-small); color: var(--text-normal); font-weight: 500; }
+.dsh-question-options { display: flex; flex-direction: column; gap: 2px; }
+.dsh-question-option {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+.dsh-question-option:hover { background: var(--background-modifier-hover); }
+.dsh-question-option input { flex: 0 0 auto; margin: 0; }
+.dsh-question-option-text { font-size: var(--font-ui-smaller); color: var(--text-normal); }
+.dsh-question-custom {
+    width: 100%;
+    min-height: auto;
+    resize: none;
+    flex: none;
+    background: var(--background-modifier-form-field);
+    color: var(--text-normal);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    padding: 4px 8px;
+    font-size: var(--font-ui-smaller);
+    margin-top: 2px;
 }
 
 /* 历史会话弹窗 */
