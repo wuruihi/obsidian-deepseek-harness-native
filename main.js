@@ -2976,6 +2976,15 @@ class DshNativeView extends ItemView {
 
         this.lastUserText = text;
         this.inputEl.value = "";
+        // 快照：发送前是否已有正在生成的 turn（steer 模式判断必须用发送前状态，
+        // 否则下面 this._running=true 会让 curMode 永远是 steer）
+        const wasRunning = !!this._running;
+        // 若上一轮 turn 已结束但未收尾（assistantEl 残留、_running 已为 false），
+        // 先收尾再发新消息，否则 beginAssistantBubble 幂等返回、新内容写进旧气泡导致错位。
+        // steer 模式（wasRunning=true）不收尾：用户消息插到活跃气泡前面，AI 续写同一气泡。
+        if (this.assistantEl && !wasRunning) {
+            this.finalizeAssistant();
+        }
         await this.addUserBubble(this.buildUserBubbleText(text, attachments));
         // 登记已本地发送的用户文本，防止 DSH 经 WS 回推同一 user/message 时重复渲染（Bug 3）
         if (!this._userTextsSent) this._userTextsSent = new Set();
@@ -2997,7 +3006,7 @@ class DshNativeView extends ItemView {
                 this._modelFixPromise = null;
             }
             // 当前 mode：默认取 settings；若正在生成中又发消息，则走 steer（运行中追加/引导，Phase F）
-            const curMode = this._running
+            const curMode = wasRunning
                 ? "steer"
                 : ((this.plugin && this.plugin.settings && this.plugin.settings.mode) || "queue");
             const parts = this.buildPromptParts(text, attachments);
@@ -3022,7 +3031,15 @@ class DshNativeView extends ItemView {
         const stamp = "u-" + (++this._userSeq || (this._userSeq = 1));
         bubble.dataset.stamp = stamp;
         // 向上翻页时插到顶部，保持阅读位置
-        if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
+        if (atTop) {
+            this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
+        } else if (this.assistantEl && this.assistantEl.parentNode === this.messagesEl) {
+            // steer 模式 / 上一轮未收尾：用户消息必须插到活跃助手气泡前面，
+            // 否则 createDiv 追加到末尾会让用户消息出现在 AI 回复下方（错位根因）。
+            this.messagesEl.insertBefore(bubble, this.assistantEl);
+        }
+        const idx = Array.from(this.messagesEl.children).indexOf(bubble);
+        console.log(`[DSH MSG] addUserBubble stamp=${stamp} atTop=${atTop} idx=${idx}/${this.messagesEl.children.length} preview=${JSON.stringify(text.slice(0,60))}`);
         try {
             await MarkdownRenderer.render(this.app, text, content, "", this);
         } catch (_e) {
@@ -3044,8 +3061,12 @@ class DshNativeView extends ItemView {
 
     beginAssistantBubble() {
         // 幂等：send() 和 DSH turn/start 都会调用，重复建泡会留一个空 DSH 泡。先到的赢，后到的复用。
-        if (this.assistantEl) return;
+        if (this.assistantEl) {
+            console.log(`[DSH MSG] beginAssistantBubble SKIP(idempotent) childCount=${this.messagesEl ? this.messagesEl.children.length : '?'}`);
+            return;
+        }
         this.assistantEl = this.messagesEl.createDiv("dsh-msg dsh-msg-assistant");
+        console.log(`[DSH MSG] beginAssistantBubble CREATE childCount=${this.messagesEl ? this.messagesEl.children.length : '?'}`);
         const roleEl = this.assistantEl.createDiv("dsh-msg-role");
         roleEl.textContent = "DSH";
         this.assistantContent = this.assistantEl.createDiv("dsh-msg-content");
@@ -3393,6 +3414,7 @@ class DshNativeView extends ItemView {
     }
 
     finalizeAssistant() {
+        console.log(`[DSH MSG] finalizeAssistant assistantMdLen=${(this.assistantMd || "").length} hadEl=${!!this.assistantEl}`);
         this.renderAssistantNow();
         if (this.assistantEl) this.assistantEl._md = this.assistantMd || "";
         this.assistantEl = null;
@@ -3591,19 +3613,25 @@ class DshNativeView extends ItemView {
         if (this._userTextsSent.size >= 64) this._userTextsSent.clear(); // 简单抗膨胀
         this._userTextsSent.add(key);
         // 实时候推防重复（关键修复）：DSH 会在发送后以 user/message 回推同一条消息。
-        // 若末尾已是助手气泡（本地用户消息已在其上）或直接是文本一致的用户气泡，跳过，
-        // 避免用户消息被追加到 AI 回复之下导致顺序错乱。仅对实时候推（atTop=false）生效，
-        // 历史翻页（atTop=true）不受影响。
+        // 仅当末尾是「活跃助手气泡」(this.assistantEl) 时跳过——此时本地用户消息已在其上方。
+        // 历史首屏渲染末尾是静态助手气泡（非 assistantEl），不能跳过，否则交替 U/A 中 user 消息会丢失。
         if (!atTop && this.messagesEl) {
             const last = this.messagesEl.lastElementChild;
             if (last) {
-                if (last.classList.contains("dsh-msg-assistant")) return;
+                if (last === this.assistantEl) {
+                    console.log(`[DSH MSG] fromEvent SKIP(last is active assistant) key=${JSON.stringify(key.slice(0,50))}`);
+                    return;
+                }
                 if (last.classList.contains("dsh-msg-user")) {
                     const c = last.querySelector(".dsh-msg-content");
-                    if (c && (c.textContent || "").replace(/\s+/g, " ").trim() === key) return;
+                    if (c && (c.textContent || "").replace(/\s+/g, " ").trim() === key) {
+                        console.log(`[DSH MSG] fromEvent SKIP(last user matches) key=${JSON.stringify(key.slice(0,50))}`);
+                        return;
+                    }
                 }
             }
         }
+        console.log(`[DSH MSG] fromEvent ADD atTop=${atTop} key=${JSON.stringify(key.slice(0,50))} childCount=${this.messagesEl ? this.messagesEl.children.length : '?'}`);
         this.addUserBubble(cleaned, atTop);
     }
 
@@ -4378,7 +4406,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.12-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.13-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
