@@ -2584,6 +2584,8 @@ class DshNativeView extends ItemView {
         this._activityHolder = null;
         // 切换会话清空已发送用户文本去重集合，避免跨会话泄漏导致历史消息被误删
         this._userTextsSent = new Set();
+        // 切换会话重置 WS catchup 标志，新会话的历史加载会重新设置
+        this._wsCatchup = false;
     }
 
     setStatus(state) {
@@ -2998,6 +3000,8 @@ class DshNativeView extends ItemView {
         this._contentSetByWs = false;
         this._gotAssistantChunks = false;
         this._pollStart = Date.now();
+        // 用户主动发消息 → 退出 WS catchup，后续 assistant 事件正常处理
+        this._wsCatchup = false;
         this.beginAssistantBubble();
         this._running = true;
         this.setLiveBar("思考中…");
@@ -3559,6 +3563,13 @@ class DshNativeView extends ItemView {
                 const recent = items.slice(-24);
                 for (const it of recent) this._renderHistoryItem(it, false);
                 this.scrollToBottom();
+                // WS catchup：历史已从 REST 完整渲染，WS 连接后会重放整个会话的事件。
+                // 若最后一轮已结束（有 turn/end），后续 WS 重放的 turn/start/chunk/end 都是旧数据，
+                // 必须忽略，否则会创建重复的 AI 气泡、导致消息顺序错乱。
+                // 直到遇到新的 user/message（不在 _userTextsSent 里）或用户主动 send，才退出 catchup。
+                const lastTurn = this.extractLatestTurn(events);
+                this._wsCatchup = !!(lastTurn && lastTurn.ended);
+                console.log(`[DSH MSG] loadHistory done, items=${items.length} lastTurnEnded=${!!(lastTurn && lastTurn.ended)} wsCatchup=${this._wsCatchup}`);
             } else {
                 // 向上翻页：在顶部插入更早的一批，保持当前阅读位置（不跳动）
                 const oldHeight = this.messagesEl.scrollHeight;
@@ -3634,6 +3645,11 @@ class DshNativeView extends ItemView {
         if (this._userTextsSent.has(key)) return;
         if (this._userTextsSent.size >= 64) this._userTextsSent.clear(); // 简单抗膨胀
         this._userTextsSent.add(key);
+        // 收到一条不在历史里的新 user/message → 退出 WS catchup，后续 assistant 事件正常处理
+        if (this._wsCatchup) {
+            console.log(`[DSH MSG] exit catchup due to new user/message key=${JSON.stringify(key.slice(0,50))}`);
+            this._wsCatchup = false;
+        }
         // 实时候推防重复（关键修复）：DSH 会在发送后以 user/message 回推同一条消息。
         // 仅当末尾是「活跃助手气泡」(this.assistantEl) 时跳过——此时本地用户消息已在其上方。
         // 历史首屏渲染末尾是静态助手气泡（非 assistantEl），不能跳过，否则交替 U/A 中 user 消息会丢失。
@@ -3800,6 +3816,14 @@ class DshNativeView extends ItemView {
 
     handleSessionEvent(ev) {
         if (!ev) return;
+        // WS catchup：历史已从 REST 完整渲染且最后一轮已结束时，忽略 WS 重放的旧 assistant 事件，
+        // 否则会创建重复 AI 气泡、导致消息顺序错乱。遇到新 user/message 或用户主动 send 时退出。
+        if (this._wsCatchup) {
+            if (ev.type === "turn/start" || ev.type === "assistant/chunk" || ev.type === "turn/end" || ev.type === "assistant/message") {
+                console.log(`[DSH MSG] handleSessionEvent SKIP(catchup) type=${ev.type}`);
+                return;
+            }
+        }
         switch (ev.type) {
             case "user/message": {
                 // vscode fold.ts：user/message 走 stripSystemContext；这里补齐 Obsidian 漏掉的事件处理
@@ -4428,7 +4452,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.14-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.15-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
