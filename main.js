@@ -2979,10 +2979,13 @@ class DshNativeView extends ItemView {
         // 快照：发送前是否已有正在生成的 turn（steer 模式判断必须用发送前状态，
         // 否则下面 this._running=true 会让 curMode 永远是 steer）
         const wasRunning = !!this._running;
-        // 若上一轮 turn 已结束但未收尾（assistantEl 残留、_running 已为 false），
-        // 先收尾再发新消息，否则 beginAssistantBubble 幂等返回、新内容写进旧气泡导致错位。
-        // steer 模式（wasRunning=true）不收尾：用户消息插到活跃气泡前面，AI 续写同一气泡。
-        if (this.assistantEl && !wasRunning) {
+        // 无论上一轮是否还在跑，只要有残留 assistantEl 就先收尾。
+        // 原因：①上一轮已结束但 turn/end 事件迟到/丢失 → 不收尾会让 beginAssistantBubble 幂等返回，新内容写进旧气泡；
+        //       ②steer 模式（用户在 AI 生成中插话）→ 收尾把已生成部分固化为独立气泡，用户消息在其后，新气泡续写，
+        //         这是标准聊天 UI 行为（Claude/ChatGPT 均如此）；
+        //       ③竞态（turn/end 在途 + 用户同时发送）→ 收尾确保用户消息永远在上一条 AI 回复之后，
+        //         不会被 addUserBubble 的"插到活跃气泡前"逻辑插到旧气泡前面。
+        if (this.assistantEl) {
             this.finalizeAssistant();
         }
         await this.addUserBubble(this.buildUserBubbleText(text, attachments));
@@ -3415,6 +3418,25 @@ class DshNativeView extends ItemView {
 
     finalizeAssistant() {
         console.log(`[DSH MSG] finalizeAssistant assistantMdLen=${(this.assistantMd || "").length} hadEl=${!!this.assistantEl}`);
+        // 空气泡清理：竞态下迟到的 turn/end 可能 finalize 一个刚创建、还没收到任何内容的新气泡。
+        // 这种气泡没有正文、没有思考、也没有活动卡片，直接从 DOM 移除，避免留一个空 "DSH" 泡。
+        const hasContent = !!(this.assistantMd && this.assistantMd.trim()) || !!(this.thinkingMd && this.thinkingMd.trim());
+        const hasActivities = this.assistantEl && this.assistantEl.querySelector(".dsh-activity, .dsh-activity-holder, [class*=activity]");
+        if (this.assistantEl && !hasContent && !hasActivities) {
+            console.log("[DSH MSG] finalizeAssistant removing empty bubble");
+            try { this.assistantEl.remove(); } catch (_e) {}
+            this.assistantEl = null;
+            this.assistantContent = null;
+            this.assistantMd = "";
+            this.thinkingMd = "";
+            this._turnDone = true;
+            this._running = false;
+            this._stopPoll();
+            this._activities = new Map();
+            this._activityHolder = null;
+            this.clearLiveBar();
+            return;
+        }
         this.renderAssistantNow();
         if (this.assistantEl) this.assistantEl._md = this.assistantMd || "";
         this.assistantEl = null;
@@ -4406,7 +4428,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.13-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.14-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
