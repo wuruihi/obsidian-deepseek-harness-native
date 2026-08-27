@@ -1729,11 +1729,14 @@ class DshNativeView extends ItemView {
                 }
             });
         } catch (e) { /* 委托失败不影响主流程 */ }
-        // 3.2) 向上翻页：滚到顶部且还有更早历史时，拉取前一批（beforeSeq 游标）
+        // 3.2) 向上翻页 + 自动滚动追踪：滚到顶部拉更早历史；用户上滑后暂停自动滚动，回到底部恢复
         try {
             this.messagesEl.addEventListener("scroll", () => {
                 if (this._loadingOlder) return;
                 if (!this.messagesEl) return;
+                // 自动滚动追踪：距底部 <= 100px 视为"在底部"，恢复自动滚动；否则暂停
+                const distFromBottom = this.messagesEl.scrollHeight - this.messagesEl.scrollTop - this.messagesEl.clientHeight;
+                this._autoScroll = distFromBottom < 100;
                 if (this.messagesEl.scrollTop < 48 && this._hasMore && this._oldestSeq != null && this.sessionId) {
                     this.loadOlder();
                 }
@@ -3001,6 +3004,8 @@ class DshNativeView extends ItemView {
         // —— 新建会话的 WS 事件不会被 mux 推送（无 session/subscribed），只能靠 REST history 拿回复
         // 取消待执行的对账：用户发新消息意味着新 turn 开始，此时对账会清空刚发的用户消息
         if (this._reconcileTimer) { clearTimeout(this._reconcileTimer); this._reconcileTimer = null; }
+        // 用户主动发消息 → 强制开启自动滚动（上滑暂停状态重置）
+        this._autoScroll = true;
         this._turnDone = false;
         this._contentSetByWs = false;
         this._gotAssistantChunks = false;
@@ -3503,6 +3508,8 @@ class DshNativeView extends ItemView {
         } catch (e) {
             console.log("[DSH reconcile] loadHistory failed:", e && e.message);
         }
+        // 重建后恢复自动滚动并滚到底部（重建丢失了滚动位置，停在顶部不合理）
+        this._autoScroll = true;
         requestAnimationFrame(() => { try { this.scrollToBottom(); } catch (_) {} });
     }
 
@@ -3748,7 +3755,10 @@ class DshNativeView extends ItemView {
     }
 
     scrollToBottom() {
-        if (this.messagesEl) this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+        if (!this.messagesEl) return;
+        // 用户上滑后 _autoScroll=false，不自动滚动；回到底部后 scroll 事件会恢复为 true
+        if (this._autoScroll === false) return;
+        this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
     }
 
     // 实时活动指示条（composer 上方）：子代理/工具执行中显示「正在执行：XXX」（Bug 4 增强）
@@ -4536,7 +4546,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.19-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.20-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
