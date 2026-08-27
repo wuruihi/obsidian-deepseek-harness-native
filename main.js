@@ -3483,7 +3483,10 @@ class DshNativeView extends ItemView {
             return;
         }
         console.log("[DSH reconcile] rebuilding from authoritative history");
-        // 清空所有消息和 turn 状态（保留 _userTextsSent 去重集）
+        // 清空所有消息和 turn 状态
+        // 必须同时清空 _userTextsSent：否则 loadHistory 渲染历史用户消息时，
+        // addUserBubbleFromEvent 检测到 key 已在去重集中（send() 时添加的），直接 return，
+        // 导致所有用户消息在对账重建后消失。
         this.messagesEl.empty();
         this.assistantEl = null;
         this.assistantContent = null;
@@ -3493,6 +3496,7 @@ class DshNativeView extends ItemView {
         this._activityHolder = null;
         this._gotAssistantChunks = false;
         this._contentSetByWs = false;
+        this._userTextsSent = new Set();
         // 从权威源重建
         try {
             await this.loadHistory(this.sessionId);
@@ -4532,7 +4536,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.18-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.19-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
