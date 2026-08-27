@@ -2587,6 +2587,8 @@ class DshNativeView extends ItemView {
         // 切换会话重置 WS catchup 标志，新会话的历史加载会重新设置
         this._wsCatchup = false;
         this._lastHistorySeq = null;
+        // 取消待执行的对账定时器
+        if (this._reconcileTimer) { clearTimeout(this._reconcileTimer); this._reconcileTimer = null; }
     }
 
     setStatus(state) {
@@ -2997,6 +2999,8 @@ class DshNativeView extends ItemView {
         this._userTextsSent.add(((stripSystemContext(text) || "").replace(/\s+/g, " ").trim()));
         // 重置 turn 生命周期标志，启动「轮询 history 兜底渲染」
         // —— 新建会话的 WS 事件不会被 mux 推送（无 session/subscribed），只能靠 REST history 拿回复
+        // 取消待执行的对账：用户发新消息意味着新 turn 开始，此时对账会清空刚发的用户消息
+        if (this._reconcileTimer) { clearTimeout(this._reconcileTimer); this._reconcileTimer = null; }
         this._turnDone = false;
         this._contentSetByWs = false;
         this._gotAssistantChunks = false;
@@ -3460,6 +3464,44 @@ class DshNativeView extends ItemView {
         this.clearLiveBar();
     }
 
+    // ===== 全量对账（对齐 VSCode scheduleSettle）=====
+    // 第一性原理：history 是唯一真相源，WS 增量渲染只是优化。
+    // turn/end 后 400ms 防抖，从 REST history 全量重建 DOM，消除所有增量错误（重复气泡、错位、丢消息）。
+    scheduleReconcile() {
+        if (this._reconcileTimer) clearTimeout(this._reconcileTimer);
+        this._reconcileTimer = setTimeout(() => {
+            this._reconcileTimer = null;
+            this.reconcileFromHistory();
+        }, 400);
+    }
+
+    async reconcileFromHistory() {
+        if (!this.sessionId || !this.messagesEl) return;
+        // 运行中不对账（正在生成的 turn 不能被历史快照覆盖）
+        if (this._running) {
+            console.log("[DSH reconcile] skip: still running");
+            return;
+        }
+        console.log("[DSH reconcile] rebuilding from authoritative history");
+        // 清空所有消息和 turn 状态（保留 _userTextsSent 去重集）
+        this.messagesEl.empty();
+        this.assistantEl = null;
+        this.assistantContent = null;
+        this.assistantMd = "";
+        this.thinkingMd = "";
+        this._activities = new Map();
+        this._activityHolder = null;
+        this._gotAssistantChunks = false;
+        this._contentSetByWs = false;
+        // 从权威源重建
+        try {
+            await this.loadHistory(this.sessionId);
+        } catch (e) {
+            console.log("[DSH reconcile] loadHistory failed:", e && e.message);
+        }
+        requestAnimationFrame(() => { try { this.scrollToBottom(); } catch (_) {} });
+    }
+
     _stopPoll() {
         if (this._pollTimer) {
             clearTimeout(this._pollTimer);
@@ -3541,6 +3583,8 @@ class DshNativeView extends ItemView {
                     }
                     if (historyAhead) this.renderAssistantFull(turn.text, turn.thinking);
                     this.finalizeAssistant();
+                    // 全量对账：poll 检测到 turn 结束也触发，400ms 后从权威 history 重建
+                    this.scheduleReconcile();
                     return;
                 }
                 // 未结束：history 领先时补齐（新建会话 WS 不推事件 / 仅思考漏正文等场景）
@@ -3553,8 +3597,9 @@ class DshNativeView extends ItemView {
                 if (!this._turnDone && Date.now() - this._pollStart < 120000) {
                     this._pollTimer = setTimeout(tick, 700);
                 } else if (!this._turnDone) {
-                    // 超过 120s 仍未结束（DSH 卡住）：强制收尾，避免永久空白气泡
+                    // 超过 120s 仍未结束（DSH 卡住）：强制收尾 + 对账
                     this.finalizeAssistant();
+                    this.scheduleReconcile();
                 }
             }
         };
@@ -3917,6 +3962,8 @@ class DshNativeView extends ItemView {
             }
             case "turn/end":
                 this.finalizeAssistant();
+                // 全量对账：400ms 后从权威 history 重建，消除增量渲染累积的所有错误
+                this.scheduleReconcile();
                 break;
             default:
                 break;
@@ -4485,7 +4532,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.17-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.18-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
