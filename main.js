@@ -3529,9 +3529,14 @@ class DshNativeView extends ItemView {
                     // extractLatestTurn 取到的是上一轮已结束的内容。若当前轮还没收到任何 WS 数据，
                     // 且取到的正文与上一轮收尾正文一致，判定为旧数据，跳过。
                     const noWsContentYet = !this._gotAssistantChunks && !this._contentSetByWs;
-                    const sameAsLastFinalized = this._lastFinalizedMd != null && turn.text === this._lastFinalizedMd;
+                    // 防旧 turn 内容误渲染：send() 后立即 poll，新 turn 还没在服务端开始，
+                    // extractLatestTurn 取到的是上一轮已结束的内容。若当前轮还没收到任何 WS 数据，
+                    // 且取到的正文与上一轮收尾正文一致（trim 后比较，避免空白字符差异），判定为旧数据。
+                    const lastFin = (this._lastFinalizedMd || "").trim();
+                    const turnTxt = (turn.text || "").trim();
+                    const sameAsLastFinalized = lastFin.length > 0 && turnTxt.length > 0 && turnTxt === lastFin;
                     if (noWsContentYet && sameAsLastFinalized) {
-                        console.log(`[DSH MSG] startTurnPoll SKIP stale turn (text len=${turn.text.length} matches lastFinalized)`);
+                        console.log(`[DSH MSG] startTurnPoll SKIP stale turn (text len=${turn.text.length} matches lastFinalized len=${lastFin.length})`);
                         return;
                     }
                     if (historyAhead) this.renderAssistantFull(turn.text, turn.thinking);
@@ -3583,7 +3588,13 @@ class DshNativeView extends ItemView {
                 }
                 const lastTurn = this.extractLatestTurn(events);
                 this._wsCatchup = !!(lastTurn && lastTurn.ended);
-                console.log(`[DSH MSG] loadHistory done, items=${items.length} lastSeq=${this._lastHistorySeq} lastTurnEnded=${!!(lastTurn && lastTurn.ended)} wsCatchup=${this._wsCatchup}`);
+                // 记录最后一轮 AI 正文，供 startTurnPoll 的 stale-turn guard 比较。
+                // loadHistory 不经过 finalizeAssistant，若不设置，_lastFinalizedMd 为 undefined，
+                // stale guard 的 `!= null` 检查会失效，poll 会把上一轮内容渲染进新气泡（重复回复根因）。
+                if (lastTurn && lastTurn.ended && lastTurn.text) {
+                    this._lastFinalizedMd = lastTurn.text;
+                }
+                console.log(`[DSH MSG] loadHistory done, items=${items.length} lastSeq=${this._lastHistorySeq} lastTurnEnded=${!!(lastTurn && lastTurn.ended)} lastFinalizedLen=${(this._lastFinalizedMd || "").length} wsCatchup=${this._wsCatchup}`);
             } else {
                 // 向上翻页：在顶部插入更早的一批，保持当前阅读位置（不跳动）
                 const oldHeight = this.messagesEl.scrollHeight;
@@ -4474,7 +4485,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.16-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.17-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
