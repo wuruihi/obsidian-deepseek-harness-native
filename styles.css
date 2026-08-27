@@ -10,6 +10,9 @@
     background: var(--background-primary);
     /* 对齐 VSCode webview 基准字号（--vscode-font-size 默认 13px） */
     font-size: 13px;
+    /* 确保面板内容可选择复制（Obsidian 某些主题/视图容器默认 user-select:none） */
+    user-select: text;
+    -webkit-user-select: text;
 }
 
 /* ===== 头部（1:1 对齐 VSCode .header：状态点 + 标题下拉 + ✎ + 模式chip + spacer + ＋） ===== */
@@ -172,6 +175,8 @@ select.dsh-chip-btn { max-width: 220px; }
     display: flex;
     flex-direction: column;
     gap: 16px;
+    user-select: text;
+    -webkit-user-select: text;
 }
 .dsh-msg {
     display: flex;

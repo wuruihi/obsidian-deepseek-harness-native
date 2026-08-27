@@ -4546,7 +4546,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.20-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.21-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
