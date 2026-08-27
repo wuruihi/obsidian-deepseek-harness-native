@@ -2586,6 +2586,7 @@ class DshNativeView extends ItemView {
         this._userTextsSent = new Set();
         // 切换会话重置 WS catchup 标志，新会话的历史加载会重新设置
         this._wsCatchup = false;
+        this._lastHistorySeq = null;
     }
 
     setStatus(state) {
@@ -3443,6 +3444,8 @@ class DshNativeView extends ItemView {
         }
         this.renderAssistantNow();
         if (this.assistantEl) this.assistantEl._md = this.assistantMd || "";
+        // 记录最后收尾的正文，供 startTurnPoll 判断取到的是不是上一轮的旧内容
+        this._lastFinalizedMd = this.assistantMd || "";
         this.assistantEl = null;
         this.assistantContent = null;
         this.assistantMd = "";
@@ -3522,6 +3525,15 @@ class DshNativeView extends ItemView {
                     // 空 turn（warmup 占位）不算真正结束：继续轮询等真实回复，否则会漏掉后续正文
                     const hasContent = turn.text || turn.thinking;
                     if (!hasContent) return;
+                    // 防旧 turn 内容误渲染：send() 后立即 poll，新 turn 还没在服务端开始，
+                    // extractLatestTurn 取到的是上一轮已结束的内容。若当前轮还没收到任何 WS 数据，
+                    // 且取到的正文与上一轮收尾正文一致，判定为旧数据，跳过。
+                    const noWsContentYet = !this._gotAssistantChunks && !this._contentSetByWs;
+                    const sameAsLastFinalized = this._lastFinalizedMd != null && turn.text === this._lastFinalizedMd;
+                    if (noWsContentYet && sameAsLastFinalized) {
+                        console.log(`[DSH MSG] startTurnPoll SKIP stale turn (text len=${turn.text.length} matches lastFinalized)`);
+                        return;
+                    }
                     if (historyAhead) this.renderAssistantFull(turn.text, turn.thinking);
                     this.finalizeAssistant();
                     return;
@@ -3563,13 +3575,15 @@ class DshNativeView extends ItemView {
                 const recent = items.slice(-24);
                 for (const it of recent) this._renderHistoryItem(it, false);
                 this.scrollToBottom();
-                // WS catchup：历史已从 REST 完整渲染，WS 连接后会重放整个会话的事件。
-                // 若最后一轮已结束（有 turn/end），后续 WS 重放的 turn/start/chunk/end 都是旧数据，
-                // 必须忽略，否则会创建重复的 AI 气泡、导致消息顺序错乱。
-                // 直到遇到新的 user/message（不在 _userTextsSent 里）或用户主动 send，才退出 catchup。
+                // 记录最后一条历史事件的 seq，WS 重放时 seq <= 此值的事件全部跳过（精确去重，替代布尔 catchup）
+                if (events.length) {
+                    const lastEv = events[events.length - 1];
+                    const lastSeq = lastEv && lastEv.event && lastEv.event.seq;
+                    if (typeof lastSeq === "number") this._lastHistorySeq = lastSeq;
+                }
                 const lastTurn = this.extractLatestTurn(events);
                 this._wsCatchup = !!(lastTurn && lastTurn.ended);
-                console.log(`[DSH MSG] loadHistory done, items=${items.length} lastTurnEnded=${!!(lastTurn && lastTurn.ended)} wsCatchup=${this._wsCatchup}`);
+                console.log(`[DSH MSG] loadHistory done, items=${items.length} lastSeq=${this._lastHistorySeq} lastTurnEnded=${!!(lastTurn && lastTurn.ended)} wsCatchup=${this._wsCatchup}`);
             } else {
                 // 向上翻页：在顶部插入更早的一批，保持当前阅读位置（不跳动）
                 const oldHeight = this.messagesEl.scrollHeight;
@@ -3816,13 +3830,21 @@ class DshNativeView extends ItemView {
 
     handleSessionEvent(ev) {
         if (!ev) return;
-        // WS catchup：历史已从 REST 完整渲染且最后一轮已结束时，忽略 WS 重放的旧 assistant 事件，
-        // 否则会创建重复 AI 气泡、导致消息顺序错乱。遇到新 user/message 或用户主动 send 时退出。
-        if (this._wsCatchup) {
-            if (ev.type === "turn/start" || ev.type === "assistant/chunk" || ev.type === "turn/end" || ev.type === "assistant/message") {
-                console.log(`[DSH MSG] handleSessionEvent SKIP(catchup) type=${ev.type}`);
-                return;
-            }
+        // 精确过滤 WS 重放：历史已从 REST 渲染后，记录了最后一条事件的 seq。
+        // WS 连接后会重放整个会话，seq <= _lastHistorySeq 的事件都是旧数据，直接跳过。
+        // 这比布尔 catchup 更精准：不受"用户发消息时重放还没结束"的时序影响。
+        if (typeof ev.seq === "number" && typeof this._lastHistorySeq === "number" && ev.seq <= this._lastHistorySeq) {
+            console.log(`[DSH MSG] handleSessionEvent SKIP(seq ${ev.seq} <= history ${this._lastHistorySeq}) type=${ev.type}`);
+            return;
+        }
+        // 兼容兜底：WS 事件可能不带 seq（旧版协议），此时用布尔 catchup 过滤 assistant 事件
+        if (this._wsCatchup && (ev.type === "turn/start" || ev.type === "assistant/chunk" || ev.type === "turn/end" || ev.type === "assistant/message")) {
+            console.log(`[DSH MSG] handleSessionEvent SKIP(catchup fallback) type=${ev.type}`);
+            return;
+        }
+        // 处理新事件后推进 _lastHistorySeq，防止 WS 重连后重放已处理过的新事件
+        if (typeof ev.seq === "number" && (typeof this._lastHistorySeq !== "number" || ev.seq > this._lastHistorySeq)) {
+            this._lastHistorySeq = ev.seq;
         }
         switch (ev.type) {
             case "user/message": {
@@ -4452,7 +4474,7 @@ class DshNativePlugin extends Plugin {
         this.serviceManager = new ServiceManager(this.getServiceOpts());
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.15-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.1.16-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
