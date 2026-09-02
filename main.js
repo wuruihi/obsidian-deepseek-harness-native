@@ -59,6 +59,7 @@ const DEFAULT_SETTINGS = {
     manualTitles: {}, // 会话手动重命名覆盖表：{ [sessionId]: 自定义标题 }，持久化以跨重启保留
     autoTitles: {}, // DSH 自动命名的缓存（session.list 不带 title，探测 history 尾页投影后缓存，跨重启保留）
     modelMemory: {}, // 按工作区记忆默认模型（v0.5.2 对齐）：{ [workspaceId]: {provider, model} }，新会话只继承本项目的
+    authToken: "", // v012 鉴权兜底：手动填启动 token（正常留空——铸 cookie 自动搞定）
 };
 
 /* ====================================================================
@@ -709,11 +710,484 @@ function dshUiRenderSpec(spec) {
     return '<div class="dui-wrap" style="gap:' + gap + 'px">' + title + items + "</div>";
 }
 
+/* ====================================================================
+ * V012 协议层（对齐 dsh-vscode src/connection/{browser-auth,auth,client,remote}.ts）
+ * —— 双协议：legacy(0.1.1-rc.x) 与 v012(0.1.2-alpha.4+) 自动探测切换。
+ * 规约：v012 = /api/<ns>/<method> 斜杠端点 + payload={args} 信封 + 鉴权 cookie；
+ *       WS 走 /api/remote.mux 帧协议（open/cancel ↔ item/end/error）。
+ * ================================================================== */
+
+/* ==== AUTH-PURE-BEGIN — v012 铸 cookie 纯函数区（回归：node scripts/auth-regress.mjs） ==== */
+const AUTH_COOKIE_PREFIX = "dsh-auth-";
+const AUTH_SECRET_RECORD = /browser-session:[\s\S]*?secret:\s*([A-Za-z0-9_-]+)/;
+const AUTH_COOKIE_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000; // 远低于服务器 30 天上限
+const AUTH_SECRET_BYTES = 32;
+
+function authB64u(buf) { return Buffer.from(buf).toString("base64url"); }
+
+/** cookie 权威串 = URL host（fetch 会原样发 Host 头） */
+function authAuthorityOf(baseUrl) {
+    return new URL(baseUrl).host;
+}
+
+/** 从 credentials.yaml 解析 browser-session 32B 签名密钥 */
+function authReadSecret(credentialsPath) {
+    let text;
+    try { text = require("fs").readFileSync(credentialsPath, "utf8"); } catch (_e) { return undefined; }
+    const m = AUTH_SECRET_RECORD.exec(text);
+    if (!m) return undefined;
+    const secret = Buffer.from(m[1], "base64url");
+    return secret.byteLength === AUTH_SECRET_BYTES ? secret : undefined;
+}
+
+/** 铸签名 cookie：name = "dsh-auth-"+b64u(sha256(authority))；value = v1.<payload>.<hmac> */
+function authMintCookie(authority, secret) {
+    const name = AUTH_COOKIE_PREFIX + authB64u(crypto.createHash("sha256").update(authority).digest());
+    const issuedAt = Date.now() - 1000; // 容忍时钟偏移（issuedAt <= now）
+    const body = authB64u(Buffer.from(JSON.stringify({ version: 1, authority, issuedAt, expiresAt: issuedAt + AUTH_COOKIE_LIFETIME_MS })));
+    const value = `v1.${body}.${authB64u(crypto.createHmac("sha256", secret).update(body).digest())}`;
+    return { name, value };
+}
+
+/** 完整路径：credentials → secret → "name=value" 串 */
+function authMintFromCredentials(baseUrl, credentialsPath) {
+    const secret = authReadSecret(credentialsPath);
+    if (!secret) return undefined;
+    const minted = authMintCookie(authAuthorityOf(baseUrl), secret);
+    return `${minted.name}=${minted.value}`;
+}
+/* ==== AUTH-PURE-END ==== */
+
+/** 鉴权链：手动 token(设置项) → 铸 cookie(credentials 持久密钥) → 日志捞启动 token 兑换。 */
+class DshAuth {
+    constructor(opts) {
+        this.opts = opts || {}; // { getManualToken, home }
+        this.cookie = undefined; // undefined=未获取; ""=无鉴权服务器
+        this.inFlight = null;
+    }
+    get hasCookie() { return this.cookie !== undefined; }
+    cookieHeader() { return this.cookie ? { cookie: this.cookie } : {}; }
+    invalidate() { this.cookie = undefined; }
+    /** GET /?token= → set-cookie（旧服务器无鉴权则置空串） */
+    async exchange(baseUrl, token) {
+        try {
+            const u = new URL("/", new URL(baseUrl));
+            u.searchParams.set("token", token);
+            const res = await requestUrl({ url: u.toString(), method: "GET", throw: false });
+            const sc = res.headers && (res.headers["set-cookie"] || res.headers["Set-Cookie"]);
+            if (sc) { this.cookie = String(sc).split(";")[0].trim(); return true; }
+            if (res.status === 200 || res.status === 302) { this.cookie = ""; return true; }
+            return false;
+        } catch (_e) { return false; }
+    }
+    /** 日志尾捞启动 token（自家服务 / ~/.dsh 下最新 .log） */
+    async discoverToken() {
+        const fs = require("fs");
+        const home = this.opts.home || "";
+        const candidates = [];
+        try {
+            for (const dir of [require("path").join(home, ".dsh", "logs"), require("path").join(home, ".dsh")]) {
+                const names = fs.readdirSync(dir).filter((n) => n.endsWith(".log"));
+                const withTime = names.map((n) => {
+                    const p = require("path").join(dir, n);
+                    return { path: p, mtime: fs.statSync(p).mtimeMs };
+                }).sort((a, b) => b.mtime - a.mtime);
+                candidates.push(...withTime.map((x) => x.path));
+            }
+        } catch (_e) { /* best effort */ }
+        for (const file of candidates) {
+            try {
+                const st = fs.statSync(file);
+                const fh = fs.openSync(file, "r");
+                const start = Math.max(0, st.size - 262144);
+                const buf = Buffer.alloc(st.size - start);
+                fs.readSync(fh, buf, 0, buf.length, start);
+                fs.closeSync(fh);
+                const m = /token=([A-Za-z0-9_-]+)/.exec(buf.toString("utf8"));
+                if (m) return m[1];
+            } catch (_e) { /* next */ }
+        }
+        return undefined;
+    }
+    /** 确保拿到 cookie（并发去重）。false=所有来源都失败。 */
+    ensureCookie(baseUrl) {
+        if (this.cookie !== undefined) return Promise.resolve(true);
+        if (this.inFlight) return this.inFlight;
+        this.inFlight = (async () => {
+            // 1. 手动 token（显式用户意图优先）
+            const manual = (this.opts.getManualToken ? this.opts.getManualToken() : "") || "";
+            if (manual && (await this.exchange(baseUrl, manual.trim()))) return true;
+            // 2. 铸 cookie：零配置、跨服务器重启有效（alpha.5 主通道）
+            const minted = authMintFromCredentials(baseUrl, require("path").join(this.opts.home || "", ".dsh", ".credentials.yaml"));
+            if (minted) { this.cookie = minted; return true; }
+            // 3. 日志 token 兑换（pre-alpha.5 / 异机启动）
+            const token = await this.discoverToken();
+            if (token && (await this.exchange(baseUrl, token))) return true;
+            return false;
+        })().finally(() => { this.inFlight = null; });
+        return this.inFlight;
+    }
+}
+
+/** v012 能力探测（对齐 dsh-vscode protocol.ts detectFlavor）：
+ *  v012 探针 = session/list + {args}；401/403 也证明是 v012（要先鉴权）。
+ *  不中再探 legacy 点端点；host.describe 兜底极老版本。 */
+async function detectFlavor(baseUrl, timeoutMs = 3000) {
+    const probe = async (method, envelope) => {
+        try {
+            const res = await withTimeout(requestUrl({
+                url: `${baseUrl}/api/${method}`,
+                method: "POST",
+                contentType: "application/json",
+                body: JSON.stringify(envelope),
+                throw: false,
+                headers: { accept: "application/json" },
+            }), timeoutMs);
+            let json = null;
+            try { json = typeof res.json === "function" ? res.json : JSON.parse(res.text || "null"); } catch (_e) { /* 非 JSON 也算探测信息 */ }
+            return { status: res.status, json };
+        } catch (_e) { return null; }
+    };
+    const p1 = await probe("session/list", { type: "client-request", rpcId: rpcId(), method: "session/list", payload: { args: {} } });
+    if (p1) {
+        if (p1.status === 401 || p1.status === 403) return { flavor: "v012", needsAuth: true };
+        if (p1.status === 200 && p1.json && p1.json.type === "server-response") return { flavor: "v012", needsAuth: false };
+    }
+    const p2 = await probe("session.list", { type: "client-request", rpcId: rpcId(), method: "session.list", payload: {} });
+    if (p2 && p2.status === 200 && p2.json && p2.json.type === "server-response") return { flavor: "legacy", needsAuth: false };
+    const p3 = await probe("host.describe", { type: "client-request", rpcId: rpcId(), method: "host.describe", payload: {} });
+    if (p3 && p3.status === 200 && p3.json && p3.json.type === "server-response") return { flavor: "legacy", needsAuth: false };
+    return undefined; // 服务不在 / 不是 DSH
+}
+
+/** 竞速超时包装（requestUrl 无原生超时） */
+function withTimeout(promise, ms) {
+    return Promise.race([promise, new Promise((_res, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
+}
+
+/** v012 流桥：单条 /api/remote.mux WS + 帧协议（open/cancel ↔ item/end/error），
+ *  对上层合成 legacy 形状的 {rpcId, payload:{type,...}} 帧 —— 视图订阅代码零改动。
+ *  帧解析复用插件里已有的手写 WS 客户端思路（握手不带 Origin、客户端帧必须 mask）。 */
+/* ==== V012-PURE-BEGIN — v012 流桥（回归：node scripts/auth-regress.mjs） ==== */
+class V012Mux {
+    constructor(opts) {
+        this.opts = opts; // { port, getCookie, onFrame, onReady, onBroken }
+        this.stopped = false;
+        this.ws = null;
+        this.buf = Buffer.alloc(0);
+        this.streams = new Map();
+        this.pendingOpens = [];
+        this.nextStreamId = 0;
+        this.clientId = undefined; // $events ready
+        this.desiredFollow = undefined;
+        this.reconnectTimer = null;
+        this.backoffMs = 1000;
+    }
+    get eventsClientId() { return this.clientId; }
+    start() { this.stopped = false; this.connect(); }
+    stop() {
+        this.stopped = true;
+        if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+        this.teardown("stopped");
+    }
+    /** 跟随当前会话（legacy 全广播无此概念；v012 必须显式 follow） */
+    follow(sessionId) {
+        this.desiredFollow = sessionId || undefined;
+        if (sessionId && this.ws) this.openFollow(sessionId);
+    }
+    /** 一次性历史尾页（session.history 首屏）：session/follow 快照帧 */
+    snapshotOnce(sessionId, maxMessages, timeoutMs = 10000) {
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (value) => { if (settled) return; settled = true; handle.cancel(); clearTimeout(timer); resolve(value); };
+            const timer = setTimeout(() => finish({ entries: [], hasMore: false }), timeoutMs);
+            const handle = this.openStream("session/follow",
+                { request: { address: { kind: "session", sessionId }, ...(maxMessages !== undefined ? { maxMessages } : {}) } },
+                {
+                    onItem: (value) => {
+                        if (value && value.type === "snapshot") {
+                            finish({
+                                entries: (value.records || []).map((r) => ({ event: r.event, view: r.view })),
+                                hasMore: !!value.hasMore,
+                                projections: value.projections,
+                                cursor: value.cursor,
+                            });
+                        }
+                    },
+                    onError: () => finish({ entries: [], hasMore: false }),
+                });
+        });
+    }
+    /** 一次性工作区基线：workspace/follow baseline 帧 */
+    workspacesOnce(timeoutMs = 10000) {
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (value) => { if (settled) return; settled = true; handle.cancel(); clearTimeout(timer); resolve(value); };
+            const timer = setTimeout(() => finish({ items: [] }), timeoutMs);
+            const handle = this.openStream("workspace/follow", {}, {
+                onItem: (value) => {
+                    if (value && value.type === "baseline") finish({ items: (value.value && value.value.items) || [] });
+                },
+                onError: () => finish({ items: [] }),
+            });
+        });
+    }
+    /** 开（或排队）一条逻辑流 */
+    openStream(endpoint, args, cbs) {
+        const streamId = "s" + (this.nextStreamId++);
+        this.streams.set(streamId, { onItem: cbs.onItem, onEnd: cbs.onEnd || (() => {}), onError: cbs.onError || (() => {}) });
+        if (this.ws) {
+            this.sendJson({ type: "open", streamId, endpoint, payload: { args } });
+        } else {
+            this.pendingOpens.push({ streamId, endpoint, args });
+        }
+        return {
+            cancel: () => {
+                this.streams.delete(streamId);
+                this.pendingOpens = this.pendingOpens.filter((p) => p.streamId !== streamId);
+                if (this.ws) this.sendJson({ type: "cancel", streamId });
+            },
+        };
+    }
+    connect() {
+        if (this.stopped) return;
+        this.teardown("reconnect");
+        const port = this.opts.port;
+        const key = crypto.randomBytes(16).toString("base64");
+        const headers = {
+            Connection: "Upgrade",
+            Upgrade: "websocket",
+            "Sec-WebSocket-Key": key,
+            "Sec-WebSocket-Version": "13",
+            Host: `127.0.0.1:${port}`,
+            // 故意不带 Origin —— 规避 DSH isTrustedApiRequest 的 origin 检查（同 legacy 桥）
+        };
+        const cookie = this.opts.getCookie ? this.opts.getCookie() : undefined;
+        if (cookie) headers.Cookie = cookie; // v012 鉴权：WS 升级也要 cookie
+        this.buf = Buffer.alloc(0);
+        const req = http.request({ host: "127.0.0.1", port, path: "/api/remote.mux", headers });
+        req.on("upgrade", (res, socket, head) => {
+            this.ws = { req, socket };
+            this.backoffMs = 1000;
+            this.buf = Buffer.concat([this.buf, Buffer.from(head || [])]);
+            socket.on("data", (chunk) => this.onData(chunk));
+            socket.on("close", () => this.onDown("ws:close"));
+            socket.on("error", () => this.onDown("ws:err"));
+            this.openPersistentStreams();
+            for (const p of this.pendingOpens) this.sendJson({ type: "open", streamId: p.streamId, endpoint: p.endpoint, payload: { args: p.args } });
+            this.pendingOpens = [];
+            if (this.opts.onReady) this.opts.onReady();
+        });
+        req.on("response", (res) => {
+            console.error("[dsh-native v012] mux 握手失败:", res.statusCode);
+            res.resume();
+            req.destroy();
+            this.scheduleReconnect();
+        });
+        req.on("error", (e) => {
+            console.error("[dsh-native v012] mux request error:", e && e.message);
+            this.scheduleReconnect();
+        });
+        req.end();
+    }
+    onData(chunk) {
+        this.buf = Buffer.concat([this.buf, chunk]);
+        let buf = this.buf;
+        while (buf.length >= 2) {
+            const b0 = buf[0], b1 = buf[1];
+            const opcode = b0 & 0x0f;
+            const masked = (b1 & 0x80) !== 0;
+            let len = b1 & 0x7f;
+            let offset = 2;
+            if (len === 126) {
+                if (buf.length < 4) break;
+                len = buf.readUInt16BE(2); offset = 4;
+            } else if (len === 127) {
+                if (buf.length < 10) break;
+                len = buf.readUInt32BE(6); offset = 10;
+            }
+            if (buf.length < offset + len) break;
+            const payload = buf.slice(offset, offset + len);
+            buf = buf.slice(offset + len);
+            if (opcode === 0x1 || opcode === 0x2) this.dispatchJson(payload.toString("utf8"));
+            else if (opcode === 0x8) { this.onDown("ws:close-frame"); return; }
+            else if (opcode === 0x9) this.wsSend(0xa, payload);
+        }
+        this.buf = buf;
+    }
+    dispatchJson(text) {
+        let frame;
+        try { frame = JSON.parse(text); } catch (_e) { return; }
+        if (!frame || typeof frame !== "object") return;
+        if (frame.type === "item" || frame.type === "end" || frame.type === "error") {
+            const entry = this.streams.get(frame.streamId);
+            if (!entry) return;
+            if (frame.type === "item") entry.onItem(frame.value);
+            else if (frame.type === "end") { this.streams.delete(frame.streamId); entry.onEnd(); }
+            else { this.streams.delete(frame.streamId); entry.onError({ code: String((frame.error && frame.error.code) || "stream-error"), message: String((frame.error && frame.error.message) || "stream error") }); }
+            return;
+        }
+        console.warn("[dsh-native v012] 未预期帧类型:", frame.type);
+    }
+    openPersistentStreams() {
+        // 旧代句柄随 socket 一起死了：全部丢弃重开
+        for (const h of [this._ctl, this._wsp, this._evt, this._flw]) { try { h && h.cancel(); } catch (_e) {} }
+        this._ctl = this.openStream("session/control", {}, { onItem: (v) => this.onControl(v), onError: () => {} });
+        this._wsp = this.openStream("workspace/follow", {}, { onItem: () => {}, onError: () => {} });
+        this._evt = this.openStream("$events", {}, { onItem: (v) => this.onRemoteEvent(v), onError: () => {} });
+        if (this.desiredFollow) this.openFollow(this.desiredFollow);
+    }
+    openFollow(sessionId) {
+        if (this._flw) { try { this._flw.cancel(); } catch (_e) {} }
+        this._flw = this.openStream("session/follow",
+            { request: { address: { kind: "session", sessionId } } },
+            {
+                onItem: (v) => {
+                    if (v && v.type === "event" && v.event) {
+                        this.emit({ rpcId: "", payload: { type: "session/event", sessionId, event: v.event, ...(v.view !== undefined ? { view: v.view } : {}) } });
+                    }
+                    // snapshot 帧是 REST 历史的事，这里忽略
+                },
+                onError: () => console.warn(`[dsh-native v012] follow 错误: ${sessionId}`),
+            });
+    }
+    onControl(value) {
+        if (!value || typeof value !== "object") return;
+        if (value.type === "baseline") {
+            const queues = (value.value && value.value.queues) || {};
+            for (const sid of Object.keys(queues)) this.emitQueue(sid, queues[sid]);
+            const projections = (value.value && value.value.projections) || {};
+            for (const sid of Object.keys(projections)) {
+                const values = (projections[sid] && projections[sid].values) || {};
+                for (const key of Object.keys(values)) {
+                    this.emit({ rpcId: "", payload: { type: "session/projection", sessionId: sid, key, value: values[key] } });
+                }
+            }
+            return;
+        }
+        if (value.type === "queue") { this.emitQueue(value.sessionId, value.items || []); return; }
+        if (value.type === "projection") {
+            this.emit({ rpcId: "", payload: { type: "session/projection", sessionId: value.sessionId, key: value.key, value: value.value } });
+        }
+    }
+    emitQueue(sessionId, items) {
+        const normalized = items.map((raw) => ({
+            id: String((raw && raw.id) || ""),
+            placement: String((raw && raw.placement) || "queued"),
+            content: (raw && raw.message && raw.message.content) || (raw && raw.content) || [],
+        }));
+        this.emit({ rpcId: "", payload: { type: "session/queue", sessionId, items: normalized } });
+    }
+    onRemoteEvent(value) {
+        if (!value || typeof value !== "object") return;
+        if (value.type === "ready") { this.clientId = value.clientId; return; }
+        if (value.type === "emit") {
+            // api-session/* 取代 legacy host/* —— 会话列表刷新信号（视图暂不消费，留口）
+            return;
+        }
+        if (value.type === "waterfall") {
+            if (value.event === "approval/request") {
+                const req = value.request || {};
+                this.emit({
+                    rpcId: value.eventId,
+                    payload: {
+                        type: "approval/requested",
+                        sessionId: value.agentId,
+                        approvalId: value.eventId,
+                        toolName: req.toolName,
+                        reason: req.reason,
+                        ...(req.callId ? { callId: String(req.callId) } : {}),
+                    },
+                });
+                return;
+            }
+            if (value.event === "user-questions/request") {
+                this.emit({
+                    rpcId: value.eventId,
+                    payload: { type: "question/requested", sessionId: value.agentId, questions: (value.request && value.request.questions) || [] },
+                });
+            }
+            return;
+        }
+        if (value.type === "cancel") {
+            this.emit({ rpcId: value.eventId, payload: { type: "approval/resolved", approvalId: value.eventId, outcome: "other" } });
+            this.emit({ rpcId: value.eventId, payload: { type: "question/resolved", questionRpcId: value.eventId } });
+        }
+    }
+    emit(frame) { if (this.opts.onFrame) this.opts.onFrame(frame); }
+    /** socket 断开统一走重连（scheduleReconnect 内含 teardown + 退避） */
+    onDown(_reason) {
+        this.scheduleReconnect();
+    }
+    scheduleReconnect() {
+        if (this.stopped || this.reconnectTimer) return;
+        const wait = this.backoffMs;
+        this.backoffMs = Math.min(this.backoffMs * 2, 15000);
+        this.teardown("broken");
+        this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this.connect(); }, wait);
+    }
+    teardown(reason) {
+        const ws = this.ws;
+        this.ws = null;
+        if (ws) {
+            try { if (ws.socket) ws.socket.destroy(); if (ws.req) ws.req.destroy(); } catch (_e) { /* ignore */ }
+        }
+        const dead = [...this.streams.values()];
+        this.streams.clear();
+        this.pendingOpens = [];
+        for (const e of dead) e.onError({ code: "stream/socket-closed", message: `remote.mux closed (${reason})` });
+        if (this.opts.onBroken) this.opts.onBroken();
+    }
+    sendJson(frame) {
+        if (!this.ws || !this.ws.socket) return;
+        this.wsSend(0x1, JSON.stringify(frame));
+    }
+    wsSend(opcode, data) {
+        if (!this.ws || !this.ws.socket) return;
+        const sock = this.ws.socket;
+        const payload = Buffer.isBuffer(data) ? data : Buffer.from(String(data));
+        const len = payload.length;
+        let header;
+        if (len < 126) header = Buffer.from([0x80 | opcode, 0x80 | len]);
+        else if (len < 65536) {
+            header = Buffer.alloc(4);
+            header[0] = 0x80 | opcode; header[1] = 0x80 | 126; header.writeUInt16BE(len, 2);
+        } else {
+            header = Buffer.alloc(10);
+            header[0] = 0x80 | opcode; header[1] = 0x80 | 127;
+            header.writeUInt32BE(0, 2); header.writeUInt32BE(len, 6);
+        }
+        const mask = crypto.randomBytes(4);
+        const masked = Buffer.alloc(len);
+        for (let i = 0; i < len; i++) masked[i] = payload[i] ^ mask[i & 3];
+        try { sock.write(Buffer.concat([header, mask, masked])); } catch (_e) { /* ignore */ }
+    }
+}
+/* ==== V012-PURE-END ==== */
+
 class DshApi {
     constructor(baseUrl) {
         this.baseUrl = baseUrl.replace(/\/+$/u, "");
+        // ---- v012 双协议状态 ----
+        this.flavor = "legacy"; // "legacy" | "v012"
+        this.auth = null; // DshAuth（plugin 注入）
+        this.mux = null; // V012Mux（plugin 注入；workspace.list/session.history 用）
+        this.historyCursor = new Map(); // sessionId → follow cursor（session/page 上界）
     }
+    setFlavor(flavor) {
+        this.flavor = flavor;
+        this.historyCursor.clear();
+    }
+    bindAuth(auth) { this.auth = auth; }
+    bindMux(mux) { this.mux = mux; }
+
     async call(method, payload = {}) {
+        if (this.flavor === "v012") return this.v012Call(method, payload);
+        return this.legacyCall(method, payload);
+    }
+
+    /** legacy(0.1.1-rc.x)：点端点 + payload 原样 + 无鉴权。 */
+    async legacyCall(method, payload = {}) {
         // 用 Obsidian 的 requestUrl 而不是原生 fetch：renderer 进程的 fetch 受 CSP 限制
         // (默认 connect-src 不含 http://127.0.0.1:任意port)，会直接抛 "Failed to fetch"。
         // requestUrl 走宿主进程，绕开 CSP/沙箱。
@@ -741,8 +1215,163 @@ class DshApi {
         const err = json.result && json.result.error ? JSON.stringify(json.result.error) : "unknown";
         throw new Error(`DSH RPC ${method} 失败: ${err}`);
     }
+
+    /** v012(0.1.2+)：斜杠端点 + {args} 信封 + cookie。结构特殊的方法逐一适配，
+     *  其余走「request 包装表 / 通用斜杠映射」。对齐 dsh-vscode client.ts。 */
+    async v012Call(method, payload) {
+        // 结构特殊方法优先
+        if (method === "session.history") return this.v012History(payload);
+        if (method === "workspace.list") {
+            if (!this.mux) throw new Error("workspace.list: v012 流桥未就绪");
+            const res = await this.mux.workspacesOnce();
+            return { items: res.items || [] };
+        }
+        if (method === "session.models") {
+            const cat = await this.v012Request("session/modelCatalog", {});
+            return { current: cat && cat.default, groups: cat && cat.groups, failures: cat && cat.failures };
+        }
+        if (method === "session.list") {
+            const value = await this.v012Request("session/list", { _request: {} });
+            const items = (value && value.items) || [];
+            // v012 行的 agentPreset 只在 projections.values 里；抬到顶层统一形状
+            return { items: items.map((i) => (i && typeof i === "object" ? { ...i, agentPreset: i.agentPreset || (i.projections && i.projections.values && i.projections.values.agentPreset) } : i)) };
+        }
+        if (method === "agentPreset.list") return this.v012Request("agentPresets/list", {});
+        if (method === "agentPreset.select") {
+            return this.v012Request("agentPresets/select", { agentId: payload && payload.sessionId, agentPreset: payload && payload.agentPreset });
+        }
+        if (method === "skill.list") return this.v012Request("skills/list", { request: { sessionId: payload && payload.sessionId } });
+        if (method === "commands/list") return this.v012Request("commands/list", { agentId: payload && payload.args && payload.args.agentId });
+        if (method === "commands/execute") {
+            return this.v012Request("commands/execute", {
+                agentId: payload && payload.args && payload.args.agentId,
+                line: payload && payload.args && payload.args.line,
+                images: (payload && payload.args && payload.args.images) || [],
+            });
+        }
+        if (method === "settings.mutate") {
+            // rc.x settings.mutate {ns, ops:[{op:"set",path,value}]} → v012 settings/update {ns, patch, expectedRevision}
+            const patch = {};
+            for (const op of ((payload && payload.ops) || [])) {
+                if (op && op.op === "set" && Array.isArray(op.path) && op.path.length) patch[op.path.join(".")] = op.value;
+            }
+            return this.v012Request("settings/update", {
+                ns: payload && payload.ns,
+                patch,
+                expectedRevision: payload && payload.expectedRevision,
+            });
+        }
+        if (method === "session.create") {
+            // 0.1.2 精确参数：request 只收 cwd
+            return this.v012Request("session/create", { request: { cwd: payload && (payload.cwd || payload.workspaceId) } });
+        }
+        // request 包装表（字段名一致，仅套 {request}）
+        const WRAPPED = new Set([
+            "session.cancel", "session.rename", "session.fork",
+            "session.attachment", "session.updateQueue", "session.selectModel",
+            "workspace.create", "workspace.archiveSession",
+        ]);
+        if (WRAPPED.has(method)) {
+            const endpoint = method.replace(/\./g, "/");
+            const request = method === "workspace.archiveSession"
+                ? { sessionId: payload && payload.sessionId } // 0.1.2 起去掉 workspaceId
+                : { ...(payload || {}) };
+            return this.v012Request(endpoint, { request });
+        }
+        if (method === "session.prompt") {
+            // 0.1.2 要求客户端铸 requestId
+            return this.v012Request("session/prompt", { request: { ...(payload || {}), requestId: `obs-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}` } });
+        }
+        // 未知方法：斜杠映射 + args 原样（让服务器大声报错而不是静默猜测）
+        return this.v012Request(method.replace(/\./g, "/"), payload);
+    }
+
+    /** legacy session.history 在 v012 上的实现：首屏 = session/follow 一次性快照
+     *  （顺带拿翻页游标），更早页 = session/page。 */
+    async v012History(payload) {
+        if (!this.mux) throw new Error("session.history: v012 流桥未就绪");
+        if (!payload || payload.beforeSeq === undefined || payload.beforeSeq === null) {
+            const snap = await this.mux.snapshotOnce(payload.sessionId, payload.maxMessages != null ? payload.maxMessages : 24);
+            if (snap.cursor !== undefined) this.historyCursor.set(payload.sessionId, snap.cursor);
+            return { events: snap.entries, hasMore: snap.hasMore, projections: snap.projections };
+        }
+        const throughSeq = this.historyCursor.get(payload.sessionId) != null
+            ? this.historyCursor.get(payload.sessionId)
+            : payload.beforeSeq;
+        const value = await this.v012Request("session/page", {
+            request: {
+                address: { kind: "session", sessionId: payload.sessionId },
+                throughSeq,
+                beforeSeq: payload.beforeSeq,
+                ...(payload.maxMessages !== undefined ? { maxMessages: payload.maxMessages } : {}),
+            },
+        });
+        return {
+            events: (value && value.records || []).map((r) => ({ event: r && r.event, view: r && r.view })),
+            hasMore: !!(value && value.hasMore),
+        };
+    }
+
+    /** v012 POST：{args} 信封 + cookie（401/403 → 重铸一次重试）。 */
+    async v012Request(endpoint, args, isRetry = false) {
+        const id = rpcId();
+        const envelope = { type: "client-request", rpcId: id, method: endpoint, payload: { args } };
+        const url = `${this.baseUrl}/api/${endpoint}`;
+        let resp;
+        try {
+            resp = await requestUrl({
+                url,
+                method: "POST",
+                contentType: "application/json",
+                body: JSON.stringify(envelope),
+                throw: false,
+                headers: { ...(this.auth ? this.auth.cookieHeader() : {}) },
+            });
+        } catch (e) {
+            throw new Error(`DSH RPC ${endpoint} 网络错误：${e && e.message ? e.message : String(e)}`);
+        }
+        if ((resp.status === 401 || resp.status === 403) && !isRetry && this.auth) {
+            this.auth.invalidate();
+            const ok = await this.auth.ensureCookie(this.baseUrl);
+            if (!ok) throw new Error("DSH 0.1.2+ 服务器需要授权（token/credentials 均不可用）");
+            return this.v012Request(endpoint, args, true);
+        }
+        if (resp.status === 401 || resp.status === 403) {
+            throw new Error("DSH 0.1.2+ 认证失败：token 无效或已过期");
+        }
+        if (resp.status < 200 || resp.status >= 300) {
+            throw new Error(`DSH RPC ${endpoint} HTTP ${resp.status} (${url})`);
+        }
+        let json;
+        try { json = typeof resp.json === "function" ? resp.json : JSON.parse(resp.text || ""); }
+        catch (e) { throw new Error(`DSH RPC ${endpoint} 返回非 JSON：${(resp.text || "").slice(0, 200)}`); }
+        if (json && json.type === "server-response" && json.result && json.result.ok) return json.result.value;
+        const err = json && json.result && json.result.error ? JSON.stringify(json.result.error) : "unknown";
+        throw new Error(`DSH RPC ${endpoint} 失败: ${err}`);
+    }
+
     async respond(rpcIdValue, value) {
-        // DSH /api/respond 约定：{type:"client-response", rpcId:<原请求rpcId>, result:{ok,value}}
+        if (this.flavor === "v012") {
+            // v012：审批/提问应答走 $events/result（需要 $events 的 clientId）
+            const v = (value || {});
+            const outcomeValue = "answer" in v ? v.answer : ("outcome" in v ? v.outcome : value);
+            const clientId = this.mux && this.mux.eventsClientId;
+            if (!clientId) return { ok: false, error: "$events 未就绪（clientId 未知）" };
+            try {
+                const res = await this.v012Request("$events/result", {
+                    clientId,
+                    eventId: rpcIdValue,
+                    outcome: { kind: "result", value: outcomeValue },
+                });
+                if (res && typeof res === "object" && "accepted" in res) {
+                    return res.accepted === true ? { ok: true } : { ok: false, error: res.reason || "not-accepted" };
+                }
+                return { ok: true };
+            } catch (e) {
+                return { ok: false, error: e && e.message ? e.message : String(e) };
+            }
+        }
+        // legacy：POST /api/respond {type:"client-response", rpcId, result:{ok,value}}
         const url = `${this.baseUrl}/api/respond`;
         const body = JSON.stringify({ type: "client-response", rpcId: rpcIdValue, result: { ok: true, value } });
         const resp = await requestUrl({
@@ -784,8 +1413,12 @@ class DshApi {
             }))
             .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     }
-    async createSession(workspaceId) {
-        return this.call("session.create", { workspaceId });
+    async createSession(workspace) {
+        // 接收工作区对象或裸 id：v012 的 session/create 精确收 cwd（对象里有 path）
+        const payload = (workspace && typeof workspace === "object")
+            ? { workspaceId: workspace.workspaceId, cwd: workspace.path }
+            : { workspaceId: workspace };
+        return this.call("session.create", payload);
     }
     async prompt(sessionId, textOrParts, mode = "queue") {
         // 支持字符串（向后兼容）或 content parts 数组（含 file/image 附件）
@@ -1516,8 +2149,22 @@ function splitDshUiSegments(text) {
                 // 开栏后没有 JSON（空栏/纯文本）：当正文处理
                 if (fenceText.trim()) segs.push({ kind: "text", text: fenceText });
             }
-            // 未找到闭合栏：流式半截，剩余内容全归当前 fence（已在 fenceLines 中）
-            if (!foundClose) break;
+            // 未找到闭合栏：流式半截（永不平衡）仍全归 fence；
+            // 但 JSON 已括号平衡时（LLM 忘写闭合栏+后面还有正文）只吃 JSON，
+            // 尾巴递归回收成正文——混合策略，兼顾「引号混乱」与「漏闭合吞正文」两类崩法。
+            if (!foundClose) {
+                if (start >= 0) {
+                    const end2 = balancedEnd(fenceText, start);
+                    if (end2 >= 0) {
+                        segs.pop(); // 弹掉整段 fence，重切成 JSON + 尾巴
+                        segs.push({ kind: "fence", text: fenceText.slice(start, end2) });
+                        const tail = fenceText.slice(end2);
+                        const tailSegs = tail.trim() ? splitDshUiSegments(tail) : [];
+                        for (const s2 of tailSegs) segs.push(s2);
+                    }
+                }
+                break;
+            }
             continue;
         }
         // 普通代码围栏（记录反引号数量，避免其内部的 ```dsh-ui 误触发）
@@ -2001,7 +2648,7 @@ class DshNativeView extends ItemView {
             this.openTabs = [this.sessions[0].sessionId];
             this.setSession(this.sessions[0].sessionId);
         } else {
-            const s = await this.api.createSession(this.workspace.workspaceId);
+            const s = await this.api.createSession(this.workspace);
             this.sessions = [{ sessionId: s.sessionId, title: "新会话", blank: true }];
             this.openTabs = [s.sessionId];
             this.setSession(s.sessionId);
@@ -2136,7 +2783,7 @@ class DshNativeView extends ItemView {
                 this.setSession(next.sessionId);
             } else {
                 try {
-                    const s = await this.api.createSession(this.workspace.workspaceId);
+                    const s = await this.api.createSession(this.workspace);
                     this.sessions = [{ sessionId: s.sessionId, title: "新会话", blank: true }];
                     this.openTabs = [s.sessionId];
                     this.setSession(s.sessionId);
@@ -2270,6 +2917,8 @@ class DshNativeView extends ItemView {
         this.loadHistory(id);
         this.updateTitleBtn();
         this.renderPresetPicker();
+        // v012：会话事件必须显式 follow 才推送（legacy 全广播，此调用无副作用）
+        if (this.plugin && this.plugin.wsFollow) this.plugin.wsFollow(id);
     }
 
     async switchSession(id) {
@@ -2282,7 +2931,7 @@ class DshNativeView extends ItemView {
     }
 
     async newSession() {
-        const s = await this.api.createSession(this.workspace.workspaceId);
+        const s = await this.api.createSession(this.workspace);
         this.sessions.unshift({ sessionId: s.sessionId, title: "新会话", blank: true });
         this.openSessionAsTab(s.sessionId);
         this.updateTitleBtn();
@@ -4518,6 +5167,13 @@ class DshNativeSettingTab extends PluginSettingTab {
                 await this.plugin.saveSettings();
             })
         );
+        new Setting(containerEl).setName("鉴权 Token（兜底）").setDesc("DSH 0.1.2+ 需要鉴权。正常留空：插件自动从 ~/.dsh/.credentials.yaml 铸永久 cookie。仅在自动鉴权失败时，把浏览器地址栏里的启动 token 粘到这里。").addText((t) =>
+            t.setPlaceholder("留空 = 自动铸 cookie").setValue(this.plugin.settings.authToken).onChange(async (v) => {
+                this.plugin.settings.authToken = v.trim();
+                await this.plugin.saveSettings();
+                if (this.plugin.auth) this.plugin.auth.invalidate(); // 下次请求重走鉴权链
+            })
+        );
     }
     _dshStatus(r, defaultInstallDir) {
         if (!this._dshStatusEl) return;
@@ -4544,9 +5200,17 @@ class DshNativePlugin extends Plugin {
         await this.loadSettings();
         this.api = new DshApi(`http://127.0.0.1:${this.settings.port}`);
         this.serviceManager = new ServiceManager(this.getServiceOpts());
+        // v012 鉴权链：手动 token（设置项）→ 铸 cookie（credentials 持久密钥）→ 日志 token
+        this.auth = new DshAuth({
+            home: process.env.USERPROFILE || process.env.HOME || "",
+            getManualToken: () => (this.settings && this.settings.authToken) || "",
+        });
+        this.api.bindAuth(this.auth);
+        this.flavor = "legacy"; // 当前协议代（detectAndConnect 会刷新）
+        this._detecting = false;
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.1.21-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.2.0-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
@@ -4568,8 +5232,8 @@ class DshNativePlugin extends Plugin {
         this.statusSubs = new Set(); // ws 状态变化时回调（立即拿到 getWsStatus）
         this._wsReconnectTimer = null;
         this.ws = null;
-        // 启动 WS 桥接（独立于 view 是否打开；view 打开时再通过 wsSubscribe 订阅）
-        this.connectDshWs();
+        // 协议探测 + WS 桥接（v012→remote.mux 帧协议；legacy→events.mux 原路径）
+        this.detectAndConnect();
 
         this.registerView(VIEW_TYPE, (leaf) => new DshNativeView(leaf, this));
 
@@ -4619,7 +5283,81 @@ class DshNativePlugin extends Plugin {
      * Origin），通过信任检查；再自行解析 WS 帧（服务端帧未 mask、单文本帧）。
      * 帧解析与重连自控，view 层订阅接口不变。
      * ================================================= */
+    /** 协议探测 → 应用 flavor → 建流。服务上线/重启后重调（服务器可能换代）。 */
+    async detectAndConnect() {
+        if (this._detecting) return;
+        this._detecting = true;
+        try {
+            const detected = await detectFlavor(`http://127.0.0.1:${this.settings.port}`, 2500);
+            if (!detected) {
+                // 服务不在线：维持现状（ServiceManager 稍后拉起后会再探测）
+                return;
+            }
+            const changed = this.flavor !== detected.flavor;
+            this.flavor = detected.flavor;
+            this.api.setFlavor(detected.flavor);
+            if (detected.flavor === "v012" && detected.needsAuth) {
+                await this.auth.ensureCookie(`http://127.0.0.1:${this.settings.port}`);
+            }
+            if (changed || !this.wsConnected) this.connectDshWs();
+            console.log(`[dsh-native] 协议代: ${detected.flavor}${detected.needsAuth ? " (auth)" : ""}`);
+        } finally {
+            this._detecting = false;
+        }
+    }
+
+    /** 视图切换会话时跟随（v012 必须显式 follow；legacy 全广播无需处理） */
+    wsFollow(sessionId) {
+        if (this.mux) this.mux.follow(sessionId);
+    }
+
+    /** 统一分发：legacy WS 解析帧与 v012 合成帧共用（计数 + 状态 + 订阅回调）。 */
+    dispatchMuxFrame(frame) {
+        this.wsFrameCount++;
+        const ft = frame && frame.payload && frame.payload.type;
+        if (ft) {
+            this.wsLastFrameTypes.push(ft);
+            if (this.wsLastFrameTypes.length > 6) this.wsLastFrameTypes.shift();
+            if (ft === "assistant/chunk" || ft === "session/event") this.wsChunkCount++;
+        }
+        this.notifyStatusSubs();
+        for (const cb of this.eventSubs) {
+            try {
+                cb(frame);
+            } catch (e) {
+                console.error("[dsh-native] event sub cb err:", e);
+            }
+        }
+    }
+
     connectDshWs() {
+        this.closeDshWs();
+        if (this.flavor === "v012") {
+            // ---- v012：remote.mux 帧协议，帧经 V012Mux 合成 legacy 形状后走统一分发 ----
+            this.wsConnected = false;
+            this.mux = new V012Mux({
+                port: this.settings.port,
+                getCookie: () => (this.auth && this.auth.cookie) || "",
+                onFrame: (frame) => this.dispatchMuxFrame(frame),
+                onReady: () => {
+                    this.wsConnected = true;
+                    this.wsCloseReason = null;
+                    this.notifyStatusSubs();
+                },
+                onBroken: () => {
+                    this.wsConnected = false;
+                    this.notifyStatusSubs();
+                },
+            });
+            this.api.bindMux(this.mux);
+            this.mux.start();
+            return;
+        }
+        this.connectLegacyWs();
+    }
+
+    /** legacy(0.1.1-rc.x)：/api/events.mux 手写 WS 客户端（原 connectDshWs 实现）。 */
+    connectLegacyWs() {
         this.closeDshWs();
         const port = this.settings.port;
         const path = "/api/events.mux";
@@ -4704,7 +5442,7 @@ class DshNativePlugin extends Plugin {
         this._wsBuf = buf;
     }
 
-    /** 解析 envelope 并喂给订阅（逻辑同原 message 回调）。 */
+    /** 解析 envelope 并喂给统一分发（legacy 路径）。 */
     deliverWsFrame(payload) {
         let frame;
         try {
@@ -4713,21 +5451,7 @@ class DshNativePlugin extends Plugin {
             console.warn("[dsh-native] WS frame parse error:", e, payload.slice(0, 100).toString());
             return;
         }
-        this.wsFrameCount++;
-        const ft = frame?.payload?.type;
-        if (ft) {
-            this.wsLastFrameTypes.push(ft);
-            if (this.wsLastFrameTypes.length > 6) this.wsLastFrameTypes.shift();
-            if (ft === "assistant/chunk") this.wsChunkCount++;
-        }
-        this.notifyStatusSubs();
-        for (const cb of this.eventSubs) {
-            try {
-                cb(frame);
-            } catch (e) {
-                console.error("[dsh-native] event sub cb err:", e);
-            }
-        }
+        this.dispatchMuxFrame(frame);
     }
 
     /** 客户端→服务端发送（必须 mask，RFC 6455）。 */
@@ -4774,6 +5498,10 @@ class DshNativePlugin extends Plugin {
         if (this._wsReconnectTimer) {
             clearTimeout(this._wsReconnectTimer);
             this._wsReconnectTimer = null;
+        }
+        if (this.mux) {
+            try { this.mux.stop(); } catch (e) { /* ignore */ }
+            this.mux = null;
         }
         if (this.ws) {
             try {
@@ -4836,7 +5564,12 @@ class DshNativePlugin extends Plugin {
     async ensureServiceOnline() {
         this.serviceManager.opts = this.getServiceOpts();
         this.api.baseUrl = `http://127.0.0.1:${this.settings.port}`;
-        return this.serviceManager.ensureOnline();
+        const r = await this.serviceManager.ensureOnline();
+        if (r.kind === "online") {
+            // 服务（重新）上线：协议代可能变了（rc.x ↔ 0.1.2+），重探测再接流
+            this.detectAndConnect();
+        }
+        return r;
     }
 
     getView() {
