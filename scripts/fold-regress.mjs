@@ -157,5 +157,19 @@ const check = (name, ok, detail = "") => {
     check("翻页前插", f.items.length === 2 && f.items[0].text === "老" && f.oldestSeq === 5);
 }
 
+// 11. 产物收集（v0.7.0）：diff 卡 locations 进 produced；读类卡不进
+{
+    const f = new DshFold();
+    f.pushMany([
+        { event: { type: "turn/start", seq: 1, data: {} } },
+        { event: { type: "tool/result", seq: 2, data: { callId: "w1" } }, view: { card: "diff", locations: [{ path: "D:\\work\\a.md" }, { path: "D:\\work\\b.md" }] } },
+        { event: { type: "tool/result", seq: 3, data: { callId: "r1" } }, view: { card: "generic", kind: "read", locations: [{ path: "D:\\work\\c.md" }] } },
+        { event: { type: "tool/result", seq: 4, data: { callId: "w2" } }, view: { card: "diff", locations: [{ path: "D:\\work\\a.md" }] } },
+    ]);
+    const turn = f.items[f.items.length - 1];
+    const p = (turn && turn.produced) || [];
+    check("产物收集", p.length === 2 && p[0] === "D:\\work\\a.md" && p[1] === "D:\\work\\b.md", JSON.stringify(p));
+}
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);

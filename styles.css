@@ -1252,6 +1252,104 @@ select.dsh-chip-btn { max-width: 220px; }
     margin-top: 6px;
 }
 
+/* ==== v0.7.0 任务/轨迹/产物卡（对齐 VSCode jobs/traj/ProducedCard） ==== */
+.dsh-job-row {
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+}
+.dsh-job-row.is-running {
+    border-color: var(--interactive-accent);
+}
+.dsh-job-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.dsh-job-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+}
+.dsh-job-dur {
+    color: var(--text-faint);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    flex: none;
+}
+.dsh-job-status {
+    color: var(--text-faint);
+    font-size: 10px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 4px;
+    padding: 0 4px;
+    flex: none;
+}
+.dsh-traj-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 11px;
+    padding: 2px 0;
+    border-bottom: 1px solid var(--background-modifier-border-hover);
+}
+.dsh-traj-seq { color: var(--text-faint); flex: none; min-width: 52px; }
+.dsh-traj-time { color: var(--text-faint); flex: none; font-variant-numeric: tabular-nums; }
+.dsh-traj-type { flex: none; color: var(--text-accent); font-weight: 500; }
+.dsh-traj-data {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+/* 产物卡（对齐 VSCode .files-card） */
+.dsh-files-card {
+    margin-top: 8px;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+.dsh-files-card-head {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 4px 8px;
+    background: var(--background-secondary);
+}
+.dsh-files-card-rows {
+    display: flex;
+    flex-direction: column;
+}
+.dsh-files-card-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    text-align: left;
+    padding: 4px 8px;
+    background: transparent;
+    border: none;
+    border-top: 1px solid var(--background-modifier-border-hover);
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-normal);
+}
+.dsh-files-card-row:hover {
+    background: var(--background-modifier-hover);
+}
+.dsh-files-card-path {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+
 
 
 

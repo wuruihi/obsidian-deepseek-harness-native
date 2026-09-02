@@ -2325,6 +2325,8 @@ class DshFold {
                 const preview = foldExtractResultPreview(d, view && view.view);
                 const isError = foldIsErrorResult(d);
                 this._finishTool(foldResultCallId(d), preview, isError);
+                // v0.7.0 产物收集（对齐 VSCode fold：成功的变更类工具 → view.locations[].path）
+                if (!isError) this._addProduced(foldProducedPaths(view && view.view));
                 break;
             }
             case "step/start": {
@@ -2344,6 +2346,13 @@ class DshFold {
         }
     }
     pushMany(entries) { for (const e of (entries || [])) this.push(e); }
+    /** 本回合产物（本轮成功变更的文件/目录路径）——去重追加（对齐 VSCode addProduced）。 */
+    _addProduced(paths) {
+        if (!paths || !paths.length) return;
+        const cur = this._ensureTurn();
+        if (!cur.produced) cur.produced = [];
+        for (const p of paths) if (!cur.produced.includes(p)) cur.produced.push(p);
+    }
     /** 前插更早的历史页（条目按时间正序到达）。 */
     unshiftMany(entries) {
         const scratch = new DshFold();
@@ -2524,6 +2533,14 @@ function foldResultPreviewOf(result) {
 
 /** wire fact（rc.2 + alpha.5 实测）：tool/result 的 callId 在 data.callId、
  *  data.message.source.callId 或 data.message.content[0].toolCallId —— 三级都收。 */
+function foldProducedPaths(view) {
+    // 对齐 VSCode producedPathsFromCallView：只有 diff 卡与 generic/edit 卡算产出
+    // （读/删除永不计入）；locations[].path 即变更位置。
+    if (!view || typeof view !== "object") return [];
+    if (view.card !== "diff" && !(view.card === "generic" && view.kind === "edit")) return [];
+    if (!Array.isArray(view.locations)) return [];
+    return view.locations.map((l) => (l && typeof l.path === "string" ? l.path : null)).filter(Boolean);
+}
 function foldResultCallId(d) {
     return String(
         (d && (d.callId != null ? d.callId : (d.toolCallId != null ? d.toolCallId
@@ -2766,6 +2783,18 @@ class DshNativeView extends ItemView {
             this.srvBtn = headerTop.createEl("button", { cls: "dsh-icon-btn", attr: { title: "服务器设置" } });
             this.srvBtn.textContent = "⚙";
             this.srvBtn.addEventListener("click", () => this.openSettingsSheet());
+        } catch (e) { /* 非致命 */ }
+        // v0.7.0 后台任务（对齐 VSCode header jobs 图标）
+        try {
+            this.jobsBtn = headerTop.createEl("button", { cls: "dsh-icon-btn", attr: { title: "后台任务" } });
+            this.jobsBtn.textContent = "🧾";
+            this.jobsBtn.addEventListener("click", () => this.openJobsSheet());
+        } catch (e) { /* 非致命 */ }
+        // v0.7.0 事件轨迹（对齐 VSCode header traj 图标）
+        try {
+            this.trajBtn = headerTop.createEl("button", { cls: "dsh-icon-btn", attr: { title: "事件轨迹" } });
+            this.trajBtn.textContent = "🧭";
+            this.trajBtn.addEventListener("click", () => this.openTrajSheet());
         } catch (e) { /* 非致命 */ }
         // 2.2) 会话列表改为右侧滑出 Sheet（v0.5.0，对齐 VSCode sessions drawer；旧下拉退役）
 
@@ -3248,8 +3277,89 @@ class DshNativeView extends ItemView {
     closeSheet() {
         if (!this._sheet) return;
         document.removeEventListener("keydown", this._sheet.escHandler);
+        if (this._sheet.timer) { clearInterval(this._sheet.timer); this._sheet.timer = null; }
         this._sheet.overlay.remove();
         this._sheet = null;
+    }
+
+    // v0.7.0 后台任务面板（对齐 VSCode jobs drawer：session/jobs 台账帧，实时时长）
+    openJobsSheet() {
+        this.openSheet("后台任务", (body) => this._renderJobsBody(body), "jobs");
+    }
+    _renderJobsBody(body) {
+        body.empty();
+        const jobs = this._jobs || [];
+        if (!jobs.length) {
+            body.createDiv("dsh-sheet-hint").textContent =
+                "当前会话没有后台任务。agent 启动的 bash/pwsh/子代理等任务会出现在这里；需要终止时可让 agent 执行 job_kill。";
+            return;
+        }
+        const render = () => {
+            body.empty();
+            for (const j of jobs) {
+                const row = body.createDiv("dsh-job-row" + (j.status === "running" ? " is-running" : ""));
+                const head = row.createDiv("dsh-job-head");
+                const dot = head.createSpan("dsh-dot" + (j.status === "running" ? " dsh-dot-running" : " dsh-dot-idle"));
+                const label = head.createSpan("dsh-job-label");
+                label.textContent = j.label || j.kind || j.id || "（任务）";
+                label.title = [j.kind, j.detail].filter(Boolean).join(" · ");
+                const dur = head.createSpan("dsh-job-dur");
+                if (j.startedAt && j.finishedAt) {
+                    dur.textContent = this._fmtDur(j.finishedAt - j.startedAt);
+                } else if (j.startedAt) {
+                    dur.textContent = this._fmtDur(Date.now() - j.startedAt);
+                }
+                if (j.status && j.status !== "running") {
+                    const st = head.createSpan("dsh-job-status");
+                    st.textContent = j.status;
+                }
+            }
+        };
+        render();
+        if (this._sheet) this._sheet.timer = setInterval(render, 1000); // 运行中任务实时走秒
+    }
+    _fmtDur(ms) {
+        const s = Math.max(0, Math.round(ms / 1000));
+        return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}`;
+    }
+
+    // v0.7.0 事件轨迹面板（对齐 VSCode traj drawer：原始事件台账 + 类型筛选）
+    openTrajSheet() {
+        this.openSheet("事件轨迹", (body) => this._renderTrajBody(body), "traj");
+    }
+    async _renderTrajBody(body) {
+        body.empty();
+        if (!this.sessionId) { body.createDiv("dsh-sheet-empty").textContent = "（先选择一个会话）"; return; }
+        const search = body.createEl("input", { cls: "dsh-sheet-search", attr: { type: "text", placeholder: "筛选事件类型（如 tool/call）…" } });
+        const list = body.createDiv("dsh-traj-list");
+        let evs = [];
+        try {
+            const h = await this.api.getHistory(this.sessionId, null, 400);
+            evs = (h.events || []).map((r) => r.event || r);
+        } catch (_e) { /* 空台账 */ }
+        const render = (q) => {
+            list.empty();
+            const needle = (q || "").trim().toLowerCase();
+            const rows = evs.filter((e) => !needle || String(e.type || "").toLowerCase().includes(needle));
+            const head = list.createDiv("dsh-sheet-hint");
+            head.textContent = `共 ${evs.length} 条事件（最近 400 条内），命中 ${rows.length} 条`;
+            for (let i = rows.length - 1; i >= 0; i--) {
+                const e = rows[i];
+                const row = list.createDiv("dsh-traj-row");
+                const seq = row.createSpan("dsh-traj-seq");
+                seq.textContent = "#" + (e.seq != null ? e.seq : "?");
+                const clock = row.createSpan("dsh-traj-time");
+                clock.textContent = e.time ? new Date(e.time).toTimeString().slice(0, 8) : "";
+                const type = row.createSpan("dsh-traj-type");
+                type.textContent = e.type || "?";
+                const prev = row.createSpan("dsh-traj-data");
+                const s = JSON.stringify(e.data || {});
+                prev.textContent = s.length > 90 ? s.slice(0, 90) + "…" : s;
+                prev.title = s.length > 90 ? s : "";
+            }
+        };
+        search.addEventListener("input", () => render(search.value));
+        render("");
     }
 
     // v0.5.0 会话面板（对齐 VSCode sessions drawer：搜索 + 行操作）
@@ -3514,6 +3624,45 @@ class DshNativeView extends ItemView {
                     input.addEventListener("input", () => { edits[field] = input.value; saveBtn.toggleAttribute("disabled", !dirty()); });
                 }
             }
+        }
+    }
+
+    // v0.7.0 打开产物文件：库内 → 打开笔记；库外 → 系统默认程序（Obsidian 反超点）
+    _openProduced(path) {
+        try {
+            const openRel = (rel) => {
+                const f = this.app.vault.getAbstractFileByPath(rel);
+                if (f) { this.app.workspace.getLeaf(false).openFile(f); return true; }
+                return false;
+            };
+            // 库内相对路径：直接开
+            if (openRel(path.replace(/\\/g, "/"))) return;
+            // 绝对路径落在库内：转相对再开
+            const base = (this.app.vault.adapter && typeof this.app.vault.adapter.path === "string") ? this.app.vault.adapter.path.replace(/\\/g, "/") : "";
+            const norm = path.replace(/\\/g, "/");
+            if (base && norm.toLowerCase().startsWith(base.toLowerCase())) {
+                const rel = norm.slice(base.length).replace(/^\//, "");
+                if (openRel(rel)) return;
+            }
+            // 库外：系统默认程序
+            if (this.app.openWithDefaultApp) { this.app.openWithDefaultApp(path); return; }
+            navigator.clipboard.writeText(path).then(() => new Notice("路径已复制：" + path));
+        } catch (e) {
+            new Notice("打开失败：" + (e && e.message ? e.message : String(e)));
+        }
+    }
+    renderProducedCard(bubble, files) {
+        const card = bubble.createDiv("dsh-files-card");
+        card.createDiv("dsh-files-card-head").textContent = `📦 本轮产出（${files.length}）`;
+        const rows = card.createDiv("dsh-files-card-rows");
+        for (const f of files) {
+            const isDir = /[\\/]$/.test(f);
+            const label = f.split(/[\\/]/).filter(Boolean).pop() || f;
+            const btn = rows.createEl("button", { cls: "dsh-files-card-row", attr: { title: f } });
+            btn.createSpan({ text: isDir ? "📁" : "📄" });
+            const p = btn.createSpan("dsh-files-card-path");
+            p.textContent = label;
+            btn.addEventListener("click", () => this._openProduced(f));
         }
     }
 
@@ -5100,6 +5249,10 @@ class DshNativeView extends ItemView {
         bubble.createDiv("dsh-msg-role").textContent = "DSH";
         const content = bubble.createDiv("dsh-msg-content");
         this.renderFoldSegments(content, turn);
+        // v0.7.0 产物卡（对齐 VSCode ProducedCard：本轮成功变更的文件，点击打开）
+        if (turn && Array.isArray(turn.produced) && turn.produced.length) {
+            this.renderProducedCard(bubble, turn.produced);
+        }
         // v0.4.0 TurnActions（对齐 VSCode TurnActions：复制 + 从此处分叉；👍👎 在 VSCode 侧仅日志桩，不搬死按钮）
         if (turn && typeof turn.text === "string" && turn.text.trim()) {
             const bar = bubble.createDiv("dsh-msg-actions");
@@ -5430,6 +5583,12 @@ class DshNativeView extends ItemView {
             case "session/queue":
                 // Phase F：运行中追加的排队消息（DSH 在每次连接时重放基线）
                 this.renderQueueStrip(payload);
+                break;
+            case "session/jobs":
+            case "jobs":
+                // v0.7.0 后台任务台账帧（bash/pwsh/子代理任务）
+                this._jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
+                if (this._sheet && this._sheet.kind === "jobs") this._renderJobsBody(this._sheet.body);
                 break;
             case "approval/requested":
                 this.handleApproval(payload, frame.rpcId);
@@ -6201,7 +6360,7 @@ class DshNativePlugin extends Plugin {
         this._detecting = false;
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.6.0-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.7.0-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
