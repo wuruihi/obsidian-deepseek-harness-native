@@ -1167,5 +1167,91 @@ select.dsh-chip-btn { max-width: 220px; }
     flex: none;
 }
 
+/* ==== v0.6.0 子代理 + 设置（对齐 VSCode subs/settings drawer） ==== */
+.dsh-sub-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.dsh-sub-row:hover { background: var(--background-modifier-hover); }
+.dsh-sub-title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+}
+.dsh-sub-back {
+    color: var(--text-accent);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 2px 0 8px 0;
+}
+.dsh-sub-back:hover { text-decoration: underline; }
+.dsh-sub-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    margin-bottom: 8px;
+}
+.dsh-sub-stop {
+    color: var(--text-error, #e93147);
+}
+.dsh-sub-transcript {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 10px;
+}
+.dsh-sub-transcript .dsh-msg { margin: 0; }
+.dsh-sub-ask {
+    display: flex;
+    gap: 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--background-modifier-border);
+}
+.dsh-sub-ask input { flex: 1; }
+.dsh-settings-ns {
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+}
+.dsh-settings-ns summary {
+    font-weight: 500;
+    font-size: 13px;
+    cursor: pointer;
+    padding: 2px 0;
+}
+.dsh-settings-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+}
+.dsh-settings-label {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dsh-settings-row input[type="text"],
+.dsh-settings-row input[type="password"],
+.dsh-settings-row input[type="number"] {
+    width: 46%;
+}
+.dsh-settings-save {
+    margin-top: 6px;
+}
+
+
 
 

@@ -1405,6 +1405,28 @@ class DshApi {
     async workspaceDelete(workspaceId) { return this.call("workspace.delete", { workspaceId }); }
     async workspaceCreate(path) { return this.call("workspace.create", { path }); }
     async workspaceMoveSession(sessionId, toWorkspaceId) { return this.call("workspace.insertSessionBefore", { workspaceId: toWorkspaceId, sessionId }); }
+    // v0.6.0 子代理（对齐 VSCode 0.16：child 是 session，list 走 session.list 的 origin/parentSessionId，
+    // 追问/打断 = session.prompt / session.cancel 指向 childId —— subagent.* 网关不开放）
+    async listSubagents(parentSessionId) {
+        const sl = await this.call("session.list", {});
+        return ((sl && sl.items) || [])
+            .filter((i) => i.origin === "subagent" && i.parentSessionId === parentSessionId)
+            .map((i) => ({ sessionId: i.sessionId, title: typeof i.title === "string" && i.title ? i.title : "（子代理）", running: !!i.running, updatedAt: i.updatedAt }));
+    }
+    async subagentPrompt(childId, text) {
+        return this.call("session.prompt", { sessionId: childId, mode: "queue", content: [{ type: "text", text }] });
+    }
+    async subagentInterrupt(childId) {
+        return this.cancel(childId);
+    }
+    // v0.6.0 服务器设置（对齐 VSCode 0.15：describe → schema 驱动表单 → update 带乐观 revision）
+    async describeSettings() {
+        return this.call("settings.describe", {});
+    }
+    async saveSetting(ns, patch, expectedRevision) {
+        // v012 映射：settings.mutate → settings/update {ns, patch, expectedRevision}
+        return this.call("settings.mutate", { ns, patch, expectedRevision });
+    }
     async listSessions(workspaceId) {
         const wl = await this.call("workspace.list");
         const ws = wl.items.find((w) => w.workspaceId === workspaceId);
@@ -2733,6 +2755,18 @@ class DshNativeView extends ItemView {
             this.wsBtn.textContent = "▤";
             this.wsBtn.addEventListener("click", () => this.openWorkspaceSheet());
         } catch (e) { /* 非致命 */ }
+        // v0.6.0 子代理面板（对齐 VSCode header subs 图标）
+        try {
+            this.subsBtn = headerTop.createEl("button", { cls: "dsh-icon-btn", attr: { title: "子代理" } });
+            this.subsBtn.textContent = "👥";
+            this.subsBtn.addEventListener("click", () => this.openSubagentsSheet());
+        } catch (e) { /* 非致命 */ }
+        // v0.6.0 服务器设置（对齐 VSCode header settings 图标）
+        try {
+            this.srvBtn = headerTop.createEl("button", { cls: "dsh-icon-btn", attr: { title: "服务器设置" } });
+            this.srvBtn.textContent = "⚙";
+            this.srvBtn.addEventListener("click", () => this.openSettingsSheet());
+        } catch (e) { /* 非致命 */ }
         // 2.2) 会话列表改为右侧滑出 Sheet（v0.5.0，对齐 VSCode sessions drawer；旧下拉退役）
 
         // 3) messages
@@ -3343,6 +3377,144 @@ class DshNativeView extends ItemView {
             modal.open();
             inp.focus();
         });
+    }
+
+    // v0.6.0 子代理面板（对齐 VSCode subs drawer：目录 + 回放 + 追问 + 打断）
+    async openSubagentsSheet() {
+        this.openSheet("子代理", (body) => this._renderSubagentsBody(body), "subs");
+    }
+    async _renderSubagentsBody(body) {
+        body.empty();
+        if (!this.sessionId) { body.createDiv("dsh-sheet-empty").textContent = "（先选择一个会话）"; return; }
+        let subs;
+        try { subs = await this.api.listSubagents(this.sessionId); }
+        catch (e) { body.createDiv("dsh-sheet-empty").textContent = "读取失败：" + (e && e.message ? e.message : String(e)); return; }
+        if (!subs.length) { body.createDiv("dsh-sheet-empty").textContent = "（当前会话还没有子代理）"; return; }
+        for (const sa of subs) {
+            const row = body.createDiv("dsh-sub-row");
+            row.createSpan("dsh-dot" + (sa.running ? " dsh-dot-running" : " dsh-dot-idle"));
+            const t = row.createSpan("dsh-sub-title");
+            t.textContent = sa.title;
+            const view = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", text: "›", attr: { title: "查看对话" } });
+            view.addEventListener("click", () => this._renderSubagentTranscript(body, sa));
+            row.addEventListener("click", () => this._renderSubagentTranscript(body, sa));
+        }
+    }
+    async _renderSubagentTranscript(body, sa) {
+        body.empty();
+        const back = body.createDiv("dsh-sub-back");
+        back.textContent = "‹ 返回目录";
+        back.addEventListener("click", () => this._renderSubagentsBody(body));
+        const head = body.createDiv("dsh-sub-head");
+        head.createSpan("dsh-dot" + (sa.running ? " dsh-dot-running" : " dsh-dot-idle"));
+        head.createSpan("dsh-sub-title").textContent = sa.title;
+        if (sa.running) {
+            const stop = head.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini dsh-sub-stop", text: "■", attr: { title: "打断子代理" } });
+            stop.addEventListener("click", () => {
+                this.api.subagentInterrupt(sa.sessionId).then(
+                    () => new Notice("已请求打断子代理"),
+                    (e) => new Notice("打断失败：" + (e && e.message ? e.message : String(e))),
+                ).then(() => this._renderSubagentTranscript(body, sa));
+            });
+        }
+        const list = body.createDiv("dsh-sub-transcript");
+        let events;
+        try {
+            const h = await this.api.getHistory(sa.sessionId, null, 100);
+            events = (h.events || []).map((r) => r.event || r);
+        } catch (e) { list.createDiv("dsh-sheet-empty").textContent = "对话读取失败"; return; }
+        const fold = new DshFold();
+        fold.pushMany(events);
+        for (const it of fold.items) {
+            if (it.kind === "user") {
+                const ub = list.createDiv("dsh-msg dsh-msg-user");
+                const uc = ub.createDiv("dsh-msg-content");
+                uc.textContent = it.text || ""; // 面板内纯文本渲染（不经主容器/去重管线）
+            } else {
+                const bubble = list.createDiv("dsh-msg dsh-msg-assistant");
+                bubble.createDiv("dsh-msg-role").textContent = "DSH";
+                const content = bubble.createDiv("dsh-msg-content");
+                this.renderFoldSegments(content, it);
+            }
+        }
+        if (!fold.items.length) list.createDiv("dsh-sheet-empty").textContent = "（无对话内容）";
+        // 追问输入
+        const bar = body.createDiv("dsh-sub-ask");
+        const inp = bar.createEl("input", { cls: "dsh-sheet-input", attr: { type: "text", placeholder: "向子代理追加指令…" } });
+        const send = bar.createEl("button", { cls: "mod-cta", text: "发送" });
+        const ask = () => {
+            const v = inp.value.trim();
+            if (!v) return;
+            send.disabled = true;
+            this.api.subagentPrompt(sa.sessionId, v).then(
+                () => { new Notice("已发送给子代理"); setTimeout(() => this._renderSubagentTranscript(body, sa), 800); },
+                (e) => { send.disabled = false; new Notice("追问失败：" + (e && e.message ? e.message : String(e))); },
+            );
+        };
+        send.addEventListener("click", ask);
+        inp.addEventListener("keydown", (e) => { if (e.key === "Enter") ask(); });
+    }
+
+    // v0.6.0 服务器设置表单（对齐 VSCode SettingsSheet：describe schema 驱动，按命名空间保存）
+    async openSettingsSheet() {
+        this.openSheet("服务器设置", (body) => this._renderSettingsBody(body), "settings");
+    }
+    async _renderSettingsBody(body) {
+        body.empty();
+        let data;
+        try { data = await this.api.describeSettings(); }
+        catch (e) { body.createDiv("dsh-sheet-empty").textContent = "读取失败：" + (e && e.message ? e.message : String(e)); return; }
+        const namespaces = (data && data.namespaces) || [];
+        if (!namespaces.length) { body.createDiv("dsh-sheet-empty").textContent = "（该服务器未开放设置描述）"; return; }
+        if (data.writable === false) body.createDiv("dsh-sheet-hint").textContent = "⚠️ 服务器标记为只读，保存会被拒绝。";
+        for (const ns of namespaces) {
+            // alpha.5 真实形状：字段表在 schema.refs[schema.uid].dict，当前值在 value/user，密钥标记在 secrets
+            const refs = (ns.schema && ns.schema.refs) || {};
+            const root = ns.schema ? refs[ns.schema.uid] : null;
+            const dict = (root && root.dict) || {};
+            const fields = Object.entries(dict)
+                .map(([field, refId]) => ({ field, ref: refs[refId] || refs[String(refId)] }))
+                .filter((f) => f && f.ref);
+            if (!fields.length) continue;
+            const secrets = new Set(ns.secrets || []);
+            const det = body.createEl("details", { cls: "dsh-settings-ns" });
+            det.createEl("summary").textContent = ns.ns || "（命名空间）";
+            const holder = det.createDiv("dsh-settings-fields");
+            const edits = {};
+            const dirty = () => Object.keys(edits).length > 0;
+            const saveBtn = holder.createEl("button", { cls: "mod-cta dsh-settings-save", text: "保存", attr: { disabled: "true" } });
+            saveBtn.addEventListener("click", () => {
+                if (!dirty()) return;
+                this.api.saveSetting(ns.ns, { ...edits }, ns.revision).then(
+                    () => { new Notice("已保存：" + ns.ns); this._renderSettingsBody(body); },
+                    (e) => new Notice("保存失败：" + (e && e.message ? e.message : String(e))),
+                );
+            });
+            for (const { field, ref } of fields) {
+                const cur = (ns.user && ns.user[field] !== undefined) ? ns.user[field]
+                    : (ns.value && ns.value[field] !== undefined) ? ns.value[field]
+                    : (ref.meta && ref.meta.default);
+                const row = holder.createDiv("dsh-settings-row");
+                const lab = row.createSpan("dsh-settings-label");
+                lab.textContent = field + (secrets.has(field) ? " 🔒" : "");
+                lab.title = (ref.meta && ref.meta.description) || "";
+                const isSecret = secrets.has(field);
+                let input;
+                if (typeof cur === "boolean") {
+                    input = row.createEl("input", { cls: "toggle", attr: { type: "checkbox" } });
+                    input.checked = !!cur;
+                    input.addEventListener("change", () => { edits[field] = input.checked; saveBtn.toggleAttribute("disabled", !dirty()); });
+                } else if (typeof cur === "number") {
+                    input = row.createEl("input", { attr: { type: "number" } });
+                    input.value = String(cur);
+                    input.addEventListener("input", () => { edits[field] = Number(input.value); saveBtn.toggleAttribute("disabled", !dirty()); });
+                } else {
+                    input = row.createEl("input", { attr: { type: isSecret ? "password" : "text" } });
+                    input.value = cur == null ? "" : String(cur);
+                    input.addEventListener("input", () => { edits[field] = input.value; saveBtn.toggleAttribute("disabled", !dirty()); });
+                }
+            }
+        }
     }
 
     toggleSessionList(force) {
@@ -6029,7 +6201,7 @@ class DshNativePlugin extends Plugin {
         this._detecting = false;
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.5.0-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.6.0-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
