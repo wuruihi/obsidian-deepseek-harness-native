@@ -969,3 +969,84 @@ select.dsh-chip-btn { max-width: 220px; }
 }
 .dsh-queue-rm:hover { color: var(--text-error); }
 
+/* ==== v0.4.0 交互主干（对齐 VSCode send-fab 红停/TurnActions/MsgImage/unread） ==== */
+/* 红色停止键：发送按钮运行态变形（VSCode send-fab stop 形态） */
+.dsh-native-send.is-stop {
+    background: #d92d20;
+    color: #fff;
+    border-color: #b42318;
+}
+.dsh-native-send.is-stop:hover {
+    background: #b42318;
+}
+/* 回合操作条：悬停浮现（对齐 VSCode .msg-actions） */
+.dsh-msg-actions {
+    display: flex;
+    gap: 4px;
+    margin-top: 6px;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+}
+.dsh-msg-assistant:hover .dsh-msg-actions,
+.dsh-msg-actions:focus-within {
+    opacity: 1;
+}
+.dsh-msg-action-btn {
+    background: transparent;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    padding: 1px 6px;
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: pointer;
+    color: var(--text-muted);
+}
+.dsh-msg-action-btn:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+/* 消息内图片（对齐 VSCode MsgImage） */
+.dsh-msg-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 6px;
+}
+.dsh-msg-image {
+    max-width: 200px;
+    max-height: 200px;
+    border-radius: 8px;
+    border: 1px solid var(--background-modifier-border);
+    object-fit: contain;
+}
+.dsh-msg-image.is-loading {
+    min-width: 72px;
+    min-height: 72px;
+    background: var(--background-modifier-hover);
+}
+.dsh-msg-image-fallback {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+/* 未读徽标（对齐 VSCode unread dot） */
+.dsh-unread-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-error, #e93147);
+    flex: none;
+    margin-left: 2px;
+}
+/* 排队消息编辑弹窗 */
+.dsh-queue-edit-area {
+    width: 100%;
+    resize: vertical;
+    margin-bottom: 8px;
+}
+.dsh-modal-row {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+

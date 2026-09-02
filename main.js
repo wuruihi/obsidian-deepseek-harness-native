@@ -1496,9 +1496,23 @@ class DshApi {
         // DSH 支持 workspace.archiveSession（VSCode manager.ts:276）。归档会话。
         return this.call("workspace.archiveSession", { workspaceId: this.workspace.workspaceId, sessionId });
     }
-    async forkSession(sessionId) {
-        // DSH 支持 session.fork（VSCode manager.ts:263 同款）。从最后一个完成的轮次复制出新会话。
-        return this.call("session.fork", { sessionId });
+    async forkSession(sessionId, atSeq) {
+        // DSH 支持 session.fork（VSCode manager.forkSessionInternal 同款）。
+        // atSeq：从此事件号分叉（TurnActions「从此处分叉」）；缺省=最后一个完成的轮次。
+        const payload = { sessionId };
+        if (atSeq != null) payload.atSeq = atSeq;
+        return this.call("session.fork", payload);
+    }
+    // v0.4.0 队列操作（对齐 VSCode manager.queueEdit/queueSteer）
+    async queueEdit(sessionId, itemId, text) {
+        return this.call("session.updateQueue", { sessionId, itemId, action: { kind: "edit", content: [{ type: "text", text }] } });
+    }
+    async queueSteer(sessionId, itemId) {
+        return this.call("session.updateQueue", { sessionId, itemId, action: { kind: "steer" } });
+    }
+    // v0.4.0 消息内图片：拉取持久化附件字节（对齐 VSCode manager.getAttachment / session.attachment）
+    async getAttachment(sessionId, attachmentId) {
+        return this.call("session.attachment", { sessionId, attachmentId });
     }
     // ---- Agent 模式（对齐 VSCode manager.refreshPresets/selectPreset）----
     async getAgentPresets() {
@@ -2896,6 +2910,7 @@ class DshNativeView extends ItemView {
             this.sendBtn.type = "button";
             this.sendBtn.addEventListener("click", (e) => {
                 e.preventDefault();
+                if (this._running) { this.requestCancel(); return; } // v0.4.0 红色停止键
                 this.send();
             });
             this.updateSendState();
@@ -2910,6 +2925,7 @@ class DshNativeView extends ItemView {
     }
 
     async onClose() {
+        this.stopElapsed();
         this.closeWs();
         if (this.messagesEl) this.messagesEl.empty();
     }
@@ -3100,6 +3116,11 @@ class DshNativeView extends ItemView {
             const dot = row.createSpan("dsh-dot" + (s.running ? " dsh-dot-running" : " dsh-dot-idle"));
             const title = row.createSpan("dsh-session-title");
             title.textContent = this._tabTitle(s);
+            // v0.4.0 未读徽标：其他会话有新事件时显示红点，打开即清除
+            if (this._unread && this._unread.has(id)) {
+                const unread = row.createSpan("dsh-unread-dot");
+                unread.setAttribute("title", "有新消息");
+            }
             const ren = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "重命名" } });
             ren.textContent = "✎";
             ren.addEventListener("click", (e) => { e.stopPropagation(); this.openRenameBar(id); });
@@ -3123,6 +3144,21 @@ class DshNativeView extends ItemView {
             new Notice("已分叉出新会话");
         } catch (e) {
             new Notice("分叉失败：" + (e && e.message ? e.message : String(e)));
+        }
+    }
+
+    // v0.4.0 从指定事件分叉（对齐 VSCode fork-at：TurnActions「从此处分叉」）
+    async forkSessionRowAt(id, atSeq) {
+        if (!id || atSeq == null) return;
+        try {
+            const child = await this.api.forkSession(id, atSeq);
+            await this.refreshSessions();
+            this.toggleSessionList(false);
+            this.openSessionAsTab(child.sessionId);
+            new Notice(`已从第 ${atSeq} 号事件处分叉出新会话`);
+        } catch (e) {
+            const msg = e && e.message ? e.message : String(e);
+            new Notice(/fork-unavailable/.test(msg) ? "该会话还没有已完成的轮次，无法分叉" : "分叉失败：" + msg);
         }
     }
 
@@ -3245,6 +3281,8 @@ class DshNativeView extends ItemView {
             // 超过 6 个标签回收最旧（最左）
             while (this.openTabs.length > 6) this.openTabs.shift();
         }
+        // v0.4.0 打开即清未读
+        if (this._unread && this._unread.delete(id)) this.renderSessionList();
         // 已是当前会话：不重建 DOM（否则会销毁正在双击的 label，导致 dblclick 收不到）
         if (id === this.sessionId) return;
         this.setSession(id);
@@ -3610,11 +3648,44 @@ class DshNativeView extends ItemView {
     // 发送按钮可用态：有文本或附件才启用
     updateSendState() {
         if (!this.sendBtn) return;
+        // v0.4.0 运行中=红色停止键（对齐 VSCode send-fab 红方块形态）
+        if (this._running) {
+            this.sendBtn.textContent = "■";
+            this.sendBtn.setAttribute("title", "停止 (Esc)");
+            this.sendBtn.setAttribute("aria-label", "停止");
+            this.sendBtn.disabled = false;
+            this.sendBtn.classList.add("is-stop");
+            this.sendBtn.classList.remove("is-disabled");
+            return;
+        }
+        this.sendBtn.textContent = "➤";
+        this.sendBtn.setAttribute("title", "发送 (Enter)");
+        this.sendBtn.setAttribute("aria-label", "发送");
+        this.sendBtn.classList.remove("is-stop");
         const hasText = this.inputEl && this.inputEl.value.trim().length > 0;
         const hasAtt = this._attachments && this._attachments.length > 0;
         const enabled = !!(hasText || hasAtt);
         this.sendBtn.disabled = !enabled;
         this.sendBtn.classList.toggle("is-disabled", !enabled);
+    }
+
+    // v0.4.0 运行计时（对齐 VSCode Elapsed）：turn/start 起表、turn/end 停表，显示在 composer-meta
+    startElapsed() {
+        this._elapsedSec = 0;
+        this.stopElapsed();
+        this.updateComposerMeta();
+        this._elapsedTimer = setInterval(() => {
+            this._elapsedSec = (this._elapsedSec || 0) + 1;
+            this.updateComposerMeta();
+        }, 1000);
+    }
+    stopElapsed() {
+        if (this._elapsedTimer) { clearInterval(this._elapsedTimer); this._elapsedTimer = null; }
+    }
+    _elapsedText() {
+        if (!this._running || !this._elapsedSec) return "";
+        const s = this._elapsedSec;
+        return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}`;
     }
 
     renderAttachments() {
@@ -4046,7 +4117,7 @@ class DshNativeView extends ItemView {
         }
     }
 
-    async addUserBubble(text, atTop = false) {
+    async addUserBubble(text, atTop = false, images = null) {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-user");
         // 修复 Bug 3：强制可见，避免被父级 flex 容器异常折叠
         bubble.style.display = "flex";
@@ -4071,6 +4142,8 @@ class DshNativeView extends ItemView {
             const pre = content.createEl("pre", { cls: "dsh-msg-fallback" });
             pre.textContent = text;
         }
+        // v0.4.0 消息内图片（对齐 VSCode MsgImage）：attachmentId → session.attachment 拉字节渲染
+        if (Array.isArray(images) && images.length) this._renderUserImages(bubble, images);
         // 渲染完成后再滚到底（仅首屏/实时发送，翻页由 loadHistory 自行控制位置）
         if (!atTop) {
             // 修复"发送后看不到自己消息"：MarkdownRenderer 异步渲染后布局高度未定，
@@ -4704,7 +4777,7 @@ class DshNativeView extends ItemView {
     }
 
     _renderHistoryItem(it, atTop) {
-        if (it.role === "user") this.addUserBubbleFromEvent({ data: { text: it.text } }, atTop);
+        if (it.role === "user") this.addUserBubbleFromEvent({ data: { text: it.text, images: it.images } }, atTop);
         else this.renderStaticTurn(it.turn, atTop);
     }
 
@@ -4715,6 +4788,23 @@ class DshNativeView extends ItemView {
         bubble.createDiv("dsh-msg-role").textContent = "DSH";
         const content = bubble.createDiv("dsh-msg-content");
         this.renderFoldSegments(content, turn);
+        // v0.4.0 TurnActions（对齐 VSCode TurnActions：复制 + 从此处分叉；👍👎 在 VSCode 侧仅日志桩，不搬死按钮）
+        if (turn && typeof turn.text === "string" && turn.text.trim()) {
+            const bar = bubble.createDiv("dsh-msg-actions");
+            const cp = bar.createEl("button", { cls: "dsh-msg-action-btn", attr: { title: "复制回答" } });
+            cp.textContent = "📋";
+            cp.addEventListener("click", () => {
+                navigator.clipboard.writeText(turn.text || "").then(
+                    () => new Notice("已复制"),
+                    () => new Notice("复制失败"),
+                );
+            });
+            if (turn.lastSeq != null) {
+                const fk = bar.createEl("button", { cls: "dsh-msg-action-btn", attr: { title: "从此处分叉出新会话" } });
+                fk.textContent = "⑂";
+                fk.addEventListener("click", () => this.forkSessionRowAt(this.sessionId, turn.lastSeq));
+            }
+        }
         if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
     }
 
@@ -4859,7 +4949,35 @@ class DshNativeView extends ItemView {
             }
         }
         console.log(`[DSH MSG] fromEvent ADD atTop=${atTop} key=${JSON.stringify(key.slice(0,50))} childCount=${this.messagesEl ? this.messagesEl.children.length : '?'}`);
-        this.addUserBubble(cleaned, atTop);
+        this.addUserBubble(cleaned, atTop, Array.isArray(d.images) && d.images.length ? d.images : null);
+    }
+
+    // v0.4.0 用户消息图片渲染：attachmentId → dataUrl（带进程内缓存，失败降级占位）
+    _renderUserImages(bubble, images) {
+        if (!this._attachCache) this._attachCache = new Map();
+        const box = bubble.createDiv("dsh-msg-images");
+        for (const img of images) {
+            const id = img && img.attachmentId;
+            if (!id) continue;
+            const el = box.createEl("img", { cls: "dsh-msg-image", attr: { alt: img.name || "图片", loading: "lazy" } });
+            const cached = this._attachCache.get(id);
+            if (cached) { el.src = cached; continue; }
+            el.addClass("is-loading");
+            const sid = this.sessionId;
+            this.api.getAttachment(sid, id).then((v) => {
+                const mediaType = (v && v.attachment && v.attachment.mediaType) || img.mediaType || "image/png";
+                const data = v && typeof v.data === "string" ? v.data : "";
+                if (!data) throw new Error("empty attachment data");
+                const url = `data:${mediaType};base64,${data}`;
+                this._attachCache.set(id, url);
+                el.src = url;
+                el.removeClass("is-loading");
+            }).catch(() => {
+                el.removeClass("is-loading");
+                el.addClass("is-broken");
+                el.replaceWith(Object.assign(document.createElement("span"), { textContent: "🖼️（图片加载失败）", className: "dsh-msg-image-fallback" }));
+            });
+        }
     }
 
     scrollToBottom() {
@@ -4957,9 +5075,12 @@ class DshNativeView extends ItemView {
     // token 用量行（对齐 VSCode .composer-meta）：控制条下方右对齐小字，无数据时隐藏
     updateComposerMeta() {
         if (!this.composerMeta) return;
+        // v0.4.0：运行计时前置（对齐 VSCode Elapsed），token 用量随后
+        const elapsed = this._elapsedText();
         const t = this.diagTokens || "";
-        if (!t) { this.composerMeta.style.display = "none"; return; }
-        this.composerMeta.textContent = t;
+        const text = [elapsed ? `⏱ ${elapsed}` : "", t].filter(Boolean).join("  ");
+        if (!text) { this.composerMeta.style.display = "none"; return; }
+        this.composerMeta.textContent = text;
         this.composerMeta.style.display = "";
     }
 
@@ -4975,8 +5096,17 @@ class DshNativeView extends ItemView {
         const payload = frame.payload;
         if (!payload) return;
         const sessionId = payload.sessionId;
-        // 只处理当前会话（WS 会广播所有会话）
-        if (sessionId && this.sessionId && sessionId !== this.sessionId) return;
+        // 只处理当前会话（WS 会广播所有会话）；其他会话的新事件 → 未读徽标（v0.4.0 对齐 VSCode unread）
+        if (sessionId && this.sessionId && sessionId !== this.sessionId) {
+            if (payload.type === "session/event") {
+                if (!this._unread) this._unread = new Set();
+                if (!this._unread.has(sessionId)) {
+                    this._unread.add(sessionId);
+                    this.renderSessionList();
+                }
+            }
+            return;
+        }
 
         switch (payload.type) {
             case "session/event":
@@ -5035,6 +5165,8 @@ class DshNativeView extends ItemView {
                 this._gotAssistantChunks = false;
                 this.beginAssistantBubble();
                 this._running = true;
+                this.startElapsed();
+                this.updateSendState();
                 this.setLiveBar("思考中…");
                 break;
             case "assistant/chunk": {
@@ -5084,6 +5216,9 @@ class DshNativeView extends ItemView {
             }
             case "turn/end":
                 this.finalizeAssistant();
+                this._running = false;
+                this.stopElapsed();
+                this.updateSendState();
                 // 全量对账：400ms 后从权威 history 重建，消除增量渲染累积的所有错误
                 this.scheduleReconcile();
                 break;
@@ -5270,6 +5405,19 @@ class DshNativeView extends ItemView {
             pre.textContent = it.placement === "steering" ? "⇢" : "⏳";
             const txt = chip.createSpan("dsh-queue-text");
             txt.textContent = text.length > 40 ? text.slice(0, 40) + "…" : text;
+            // v0.4.0 队列操作（对齐 VSCode queue-edit/queue-steer）：编辑 / 插队转向 / 移除
+            const ed = chip.createEl("span", { cls: "dsh-icon-btn dsh-icon-mini", text: "✎", attr: { title: "编辑排队消息" } });
+            ed.addEventListener("click", () => this.queueEditRow(it));
+            if (it.placement !== "steering") {
+                const st = chip.createEl("span", { cls: "dsh-icon-btn dsh-icon-mini dsh-queue-steer", text: "⇢", attr: { title: "插队转向：立即作用于当前运行轮" } });
+                st.addEventListener("click", () => {
+                    if (this.sessionId && it.id) {
+                        this.api.queueSteer(this.sessionId, it.id).catch((e) => {
+                            new Notice("插队失败：" + (e && e.message ? e.message : String(e)));
+                        });
+                    }
+                });
+            }
             const rm = chip.createEl("span", { cls: "dsh-icon-btn dsh-icon-mini dsh-queue-rm", text: "×", attr: { title: "移除" } });
             rm.addEventListener("click", () => {
                 if (this.sessionId && it.id) {
@@ -5278,6 +5426,30 @@ class DshNativeView extends ItemView {
             });
         }
         strip.style.display = "";
+    }
+
+    // v0.4.0 排队消息编辑弹窗（对齐 VSCode queue-edit：server action kind:"edit"）
+    queueEditRow(it) {
+        const text = ((it.content || []).map((c) => c.text || "").join("")) || "";
+        const modal = new Modal(this.app);
+        modal.titleEl.setText("编辑排队消息");
+        const ta = modal.contentEl.createEl("textarea", { cls: "dsh-queue-edit-area" });
+        ta.value = text;
+        ta.rows = 5;
+        const row = modal.contentEl.createDiv("dsh-modal-row");
+        const ok = row.createEl("button", { cls: "mod-cta", text: "保存" });
+        ok.addEventListener("click", () => {
+            modal.close();
+            if (this.sessionId && it.id && ta.value.trim()) {
+                this.api.queueEdit(this.sessionId, it.id, ta.value).catch((e) => {
+                    new Notice("编辑失败：" + (e && e.message ? e.message : String(e)));
+                });
+            }
+        });
+        const cancel = row.createEl("button", { text: "取消" });
+        cancel.addEventListener("click", () => modal.close());
+        modal.open();
+        ta.focus();
     }
 
     /* ---------- 审批 / 提问 ---------- */
@@ -5717,7 +5889,7 @@ class DshNativePlugin extends Plugin {
         this._detecting = false;
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.3.0-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.4.0-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
