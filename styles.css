@@ -1049,4 +1049,123 @@ select.dsh-chip-btn { max-width: 220px; }
     justify-content: flex-end;
 }
 
+/* ==== v0.5.0 右侧滑出 Sheet（对齐 VSCode .sheet-overlay/.sheet） ==== */
+.dsh-sheet-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.25);
+    z-index: 40;
+    display: flex;
+    justify-content: flex-end;
+}
+.dsh-sheet {
+    width: min(360px, 92%);
+    height: 100%;
+    background: var(--background-primary);
+    border-left: 1px solid var(--background-modifier-border);
+    display: flex;
+    flex-direction: column;
+    transform: translateX(24px);
+    opacity: 0;
+    transition: transform 0.16s ease, opacity 0.16s ease;
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.12);
+}
+.dsh-sheet.is-open {
+    transform: translateX(0);
+    opacity: 1;
+}
+.dsh-sheet-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--background-modifier-border);
+    flex: none;
+}
+.dsh-sheet-title {
+    font-weight: 600;
+    font-size: 13px;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dsh-sheet-close { flex: none; }
+.dsh-sheet-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px;
+}
+.dsh-sheet-search {
+    width: 100%;
+    margin-bottom: 8px;
+}
+.dsh-sheet-sessions .dsh-session-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+}
+.dsh-sheet-sessions .dsh-session-row:hover {
+    background: var(--background-modifier-hover);
+}
+.dsh-sheet-sessions .dsh-session-row.is-current {
+    background: var(--background-modifier-active-hover);
+}
+.dsh-sheet-empty {
+    color: var(--text-faint);
+    padding: 12px 4px;
+    font-size: 12px;
+}
+.dsh-sheet-hint {
+    color: var(--text-faint);
+    font-size: 11px;
+    margin-bottom: 8px;
+    line-height: 1.5;
+}
+.dsh-sheet-input {
+    width: 100%;
+}
+/* 工作区行 */
+.dsh-ws-new-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+.dsh-ws-new-row .dsh-sheet-input { flex: 1; }
+.dsh-ws-row {
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    margin-bottom: 8px;
+}
+.dsh-ws-row.is-current {
+    border-color: var(--interactive-accent);
+}
+.dsh-ws-row-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.dsh-ws-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: default;
+}
+.dsh-ws-count {
+    color: var(--text-faint);
+    font-size: 11px;
+    flex: none;
+}
+
+
 

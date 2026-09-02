@@ -1270,6 +1270,8 @@ class DshApi {
             "session.cancel", "session.rename", "session.fork",
             "session.attachment", "session.updateQueue", "session.selectModel",
             "workspace.create", "workspace.archiveSession",
+            "workspace.rename", "workspace.insertBefore", "workspace.delete",
+            "workspace.insertSessionBefore",
         ]);
         if (WRAPPED.has(method)) {
             const endpoint = method.replace(/\./g, "/");
@@ -1392,6 +1394,17 @@ class DshApi {
         if (!ws) ws = await this.call("workspace.create", { path: vaultPath });
         return ws;
     }
+    // v0.5.0 工作区管理（对齐 VSCode manager.workspace*：rename/insertBefore/delete/create/insertSessionBefore）
+    async listWorkspaces() { return this.call("workspace.list"); }
+    async workspaceRename(workspaceId, title) { return this.call("workspace.rename", { workspaceId, title }); }
+    async workspaceMove(workspaceId, beforeWorkspaceId) {
+        const p = { workspaceId };
+        if (beforeWorkspaceId) p.beforeWorkspaceId = beforeWorkspaceId;
+        return this.call("workspace.insertBefore", p);
+    }
+    async workspaceDelete(workspaceId) { return this.call("workspace.delete", { workspaceId }); }
+    async workspaceCreate(path) { return this.call("workspace.create", { path }); }
+    async workspaceMoveSession(sessionId, toWorkspaceId) { return this.call("workspace.insertSessionBefore", { workspaceId: toWorkspaceId, sessionId }); }
     async listSessions(workspaceId) {
         const wl = await this.call("workspace.list");
         const ws = wl.items.find((w) => w.workspaceId === workspaceId);
@@ -2714,9 +2727,13 @@ class DshNativeView extends ItemView {
             this.newBtn.textContent = "＋";
             this.newBtn.addEventListener("click", () => this.newSession());
         } catch (e) { return fatal("createEl newBtn", e); }
-        // 2.2) 会话列表下拉（对齐 VSCode .session-list，替换原多标签栏）
-        try { this.sessionList = header.createDiv("dsh-session-list"); this.sessionList.style.display = "none"; }
-        catch (e) { return fatal("createDiv sessionList", e); }
+        // v0.5.0 工作区管理入口（对齐 VSCode header folder 图标）
+        try {
+            this.wsBtn = headerTop.createEl("button", { cls: "dsh-icon-btn", attr: { title: "工作区管理" } });
+            this.wsBtn.textContent = "▤";
+            this.wsBtn.addEventListener("click", () => this.openWorkspaceSheet());
+        } catch (e) { /* 非致命 */ }
+        // 2.2) 会话列表改为右侧滑出 Sheet（v0.5.0，对齐 VSCode sessions drawer；旧下拉退役）
 
         // 3) messages
         try { this.messagesEl = root.createDiv("dsh-native-messages"); }
@@ -3104,35 +3121,7 @@ class DshNativeView extends ItemView {
         }
     }
 
-    renderSessionList() {
-        if (!this.sessionList) return;
-        this.sessionList.empty();
-        // 对齐 VSCode .session-list：列出全部可见会话（而非仅本地打开的标签）
-        for (const s of this.sessions) {
-            const id = s.sessionId;
-            const row = this.sessionList.createEl("div", {
-                cls: "dsh-session-row" + (id === this.sessionId ? " is-current" : ""),
-            });
-            const dot = row.createSpan("dsh-dot" + (s.running ? " dsh-dot-running" : " dsh-dot-idle"));
-            const title = row.createSpan("dsh-session-title");
-            title.textContent = this._tabTitle(s);
-            // v0.4.0 未读徽标：其他会话有新事件时显示红点，打开即清除
-            if (this._unread && this._unread.has(id)) {
-                const unread = row.createSpan("dsh-unread-dot");
-                unread.setAttribute("title", "有新消息");
-            }
-            const ren = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "重命名" } });
-            ren.textContent = "✎";
-            ren.addEventListener("click", (e) => { e.stopPropagation(); this.openRenameBar(id); });
-            const forkBtn = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "分叉会话（从最后一个完成的轮次复制出新会话）" } });
-            forkBtn.textContent = "⑂";
-            forkBtn.addEventListener("click", (e) => { e.stopPropagation(); this.forkSessionRow(id); });
-            const arc = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "归档（从列表隐藏，可在 DSH 网页版找回）" } });
-            arc.textContent = "🗄";
-            arc.addEventListener("click", (e) => { e.stopPropagation(); this.archiveSessionRow(id); });
-            row.addEventListener("click", () => { this.toggleSessionList(false); this.openSessionAsTab(id); });
-        }
-    }
+    // （v0.5.0 会话列表已迁移为右侧 Sheet —— 见 openSessionsSheet/_renderSessionsBody/renderSessionList）
 
     // 分叉会话（对齐 VSCode fork-session）
     async forkSessionRow(id) {
@@ -3204,16 +3193,167 @@ class DshNativeView extends ItemView {
         void this.enrichSessionsInBackground();
     }
 
-    toggleSessionList(force) {
-        if (!this.sessionList) return;
-        const show = force === undefined ? (this.sessionList.style.display === "none") : force;
-        if (show) {
-            this.renderSessionList();
-            this.sessionList.style.display = "block";
-            // 展开时顺手补一轮标题探测（后台异步，学到新名字会自动重渲染）
-            void this.enrichSessionsInBackground();
+    // v0.5.0 右侧滑出 Sheet（对齐 VSCode Sheet：0.16s 滑入 / Esc / 点遮罩关闭）
+    openSheet(title, build, kind = "") {
+        this.closeSheet();
+        if (!this.contentEl) return;
+        const overlay = this.contentEl.createDiv("dsh-sheet-overlay");
+        const sheet = overlay.createDiv("dsh-sheet");
+        const head = sheet.createDiv("dsh-sheet-head");
+        head.createSpan("dsh-sheet-title").textContent = title;
+        const close = head.createEl("button", { cls: "dsh-icon-btn dsh-sheet-close", text: "×", attr: { title: "关闭 (Esc)" } });
+        close.addEventListener("click", () => this.closeSheet());
+        overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) this.closeSheet(); });
+        const body = sheet.createDiv("dsh-sheet-body");
+        const escHandler = (e) => { if (e.key === "Escape") this.closeSheet(); };
+        document.addEventListener("keydown", escHandler);
+        this._sheet = { overlay, body, kind, escHandler };
+        build(body);
+        requestAnimationFrame(() => sheet.addClass("is-open"));
+    }
+    closeSheet() {
+        if (!this._sheet) return;
+        document.removeEventListener("keydown", this._sheet.escHandler);
+        this._sheet.overlay.remove();
+        this._sheet = null;
+    }
+
+    // v0.5.0 会话面板（对齐 VSCode sessions drawer：搜索 + 行操作）
+    openSessionsSheet() {
+        this.openSheet("会话列表", (body) => this._renderSessionsBody(body), "sessions");
+        void this.enrichSessionsInBackground();
+    }
+    _renderSessionsBody(body) {
+        body.empty();
+        const search = body.createEl("input", { cls: "dsh-sheet-search", attr: { type: "text", placeholder: "搜索会话…" } });
+        const list = body.createDiv("dsh-sheet-sessions");
+        const render = (q) => {
+            list.empty();
+            const needle = (q || "").trim().toLowerCase();
+            const rows = this.sessions.filter((s) => !needle || (this._tabTitle(s) || "").toLowerCase().includes(needle));
+            if (!rows.length) { list.createDiv("dsh-sheet-empty").textContent = "（暂无会话）"; return; }
+            for (const s of rows) {
+                const id = s.sessionId;
+                const row = list.createDiv("dsh-session-row" + (id === this.sessionId ? " is-current" : ""));
+                const dot = row.createSpan("dsh-dot" + (s.running ? " dsh-dot-running" : " dsh-dot-idle"));
+                const title = row.createSpan("dsh-session-title");
+                title.textContent = this._tabTitle(s);
+                if (this._unread && this._unread.has(id)) row.createSpan("dsh-unread-dot").setAttribute("title", "有新消息");
+                const ren = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "重命名" } });
+                ren.textContent = "✎";
+                ren.addEventListener("click", (e) => { e.stopPropagation(); this.openRenameBar(id); });
+                const forkBtn = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "分叉会话" } });
+                forkBtn.textContent = "⑂";
+                forkBtn.addEventListener("click", (e) => { e.stopPropagation(); this.forkSessionRow(id); });
+                const arc = row.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", attr: { title: "归档（从列表隐藏，可在 DSH 网页版找回）" } });
+                arc.textContent = "🗄";
+                arc.addEventListener("click", (e) => { e.stopPropagation(); this.archiveSessionRow(id); });
+                row.addEventListener("click", () => { this.closeSheet(); this.openSessionAsTab(id); });
+            }
+        };
+        search.addEventListener("input", () => render(search.value));
+        render("");
+    }
+
+    // v0.5.0 工作区面板（对齐 VSCode workspace drawer：真分组管理）
+    async openWorkspaceSheet() {
+        this.openSheet("工作区", (body) => this._renderWorkspaceBody(body), "workspace");
+    }
+    async _renderWorkspaceBody(body) {
+        body.empty();
+        body.createDiv("dsh-sheet-hint").textContent = "工作区=会话分组（按项目目录）。此处重命名/排序/删除分组，或把当前会话移入其他分组。";
+        let wl;
+        try { wl = await this.api.listWorkspaces(); }
+        catch (e) {
+            body.createDiv("dsh-sheet-empty").textContent = "读取失败：" + (e && e.message ? e.message : String(e));
+            return;
         }
-        else this.sessionList.style.display = "none";
+        const items = wl.items || [];
+        const curWs = this.workspace && this.workspace.workspaceId;
+        const reload = async () => {
+            try {
+                const fresh = await this.api.listWorkspaces();
+                const me = (fresh.items || []).find((w) => w.workspaceId === curWs);
+                if (me) this.workspace = me; // title/path 可能已变
+            } catch (_e) { /* 保留旧值 */ }
+            await this.refreshSessions();
+            this._renderWorkspaceBody(body);
+        };
+        const guard = (label, p) => p.then(
+            () => new Notice(label + "完成"),
+            (e) => new Notice(label + "失败：" + (e && e.message ? e.message : String(e))),
+        ).then(reload);
+        // 新建行
+        const newRow = body.createDiv("dsh-ws-new-row");
+        const inp = newRow.createEl("input", { cls: "dsh-sheet-input", attr: { type: "text", placeholder: "新分组目录路径，如 D:\\project" } });
+        const add = newRow.createEl("button", { cls: "mod-cta", text: "添加" });
+        add.addEventListener("click", () => {
+            const v = inp.value.trim();
+            if (v) guard("工作区添加", this.api.workspaceCreate(v));
+        });
+        inp.addEventListener("keydown", (e) => { if (e.key === "Enter") add.click(); });
+        // 工作区行
+        for (let i = 0; i < items.length; i++) {
+            const ws = items[i];
+            const row = body.createDiv("dsh-ws-row" + (ws.workspaceId === curWs ? " is-current" : ""));
+            const head = row.createDiv("dsh-ws-row-head");
+            const name = head.createSpan("dsh-ws-name");
+            name.textContent = (ws.title || (ws.path || "").split(/[\\/]/).filter(Boolean).pop() || "（未命名）") + (ws.workspaceId === curWs ? " ·当前" : "");
+            name.title = ws.path || "";
+            const cnt = head.createSpan("dsh-ws-count");
+            cnt.textContent = ((ws.sessionIds || []).length) + " 会话";
+            const up = head.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", text: "↑", attr: { title: "上移" } });
+            up.addEventListener("click", () => { if (i > 0) guard("工作区移动", this.api.workspaceMove(ws.workspaceId, items[i - 1].workspaceId)); });
+            const down = head.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", text: "↓", attr: { title: "下移" } });
+            down.addEventListener("click", () => { if (i < items.length - 1) guard("工作区移动", this.api.workspaceMove(items[i + 1].workspaceId, ws.workspaceId)); });
+            const ren = head.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", text: "✎", attr: { title: "重命名" } });
+            ren.addEventListener("click", async () => {
+                const v = await this._promptModal("重命名工作区", ws.title || "");
+                if (v != null && v.trim()) guard("工作区重命名", this.api.workspaceRename(ws.workspaceId, v.trim()));
+            });
+            const del = head.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", text: "🗑", attr: { title: "删除分组（会话不会被删）" } });
+            del.addEventListener("click", () => {
+                if (!confirm("删除工作区分组「" + (ws.title || ws.path) + "」？分组内会话不会被删除。")) return;
+                guard("工作区删除", this.api.workspaceDelete(ws.workspaceId));
+            });
+            if (ws.workspaceId !== curWs && this.sessionId) {
+                const mv = head.createEl("button", { cls: "dsh-icon-btn dsh-icon-mini", text: "⇤", attr: { title: "把当前会话移入此分组" } });
+                mv.addEventListener("click", () => guard("会话移组", this.api.workspaceMoveSession(this.sessionId, ws.workspaceId)));
+            }
+        }
+        if (!items.length) body.createDiv("dsh-sheet-empty").textContent = "（暂无工作区）";
+    }
+
+    // v0.5.0 通用单行输入弹窗（工作区重命名等）
+    _promptModal(title, initial) {
+        return new Promise((resolve) => {
+            const modal = new Modal(this.app);
+            modal.titleEl.setText(title);
+            const inp = modal.contentEl.createEl("input", { cls: "dsh-sheet-input", attr: { type: "text" } });
+            inp.value = initial || "";
+            const row = modal.contentEl.createDiv("dsh-modal-row");
+            const ok = row.createEl("button", { cls: "mod-cta", text: "保存" });
+            ok.addEventListener("click", () => { modal.close(); resolve(inp.value); });
+            const cancel = row.createEl("button", { text: "取消" });
+            cancel.addEventListener("click", () => { modal.close(); resolve(null); });
+            inp.addEventListener("keydown", (e) => {
+                if (e.key === "Enter") { modal.close(); resolve(inp.value); }
+                else if (e.key === "Escape") { modal.close(); resolve(null); }
+            });
+            modal.open();
+            inp.focus();
+        });
+    }
+
+    toggleSessionList(force) {
+        // v0.5.0：会话列表迁移为右侧 Sheet；旧调用点语义不变（false=收起）
+        if (force === false) this.closeSheet();
+        else this.openSessionsSheet();
+    }
+
+    renderSessionList() {
+        // v0.5.0：会话 Sheet 打开时刷新其内容（未读徽标/列表变化）
+        if (this._sheet && this._sheet.kind === "sessions") this._renderSessionsBody(this._sheet.body);
     }
 
     updateTitleBtn() {
@@ -5889,7 +6029,7 @@ class DshNativePlugin extends Plugin {
         this._detecting = false;
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.4.0-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.5.0-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
