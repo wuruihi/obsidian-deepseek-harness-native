@@ -2181,6 +2181,364 @@ function splitDshUiSegments(text) {
 }
 /* ==== FENCE-PURE-END ==== */
 
+/* ==== FOLD-PURE-BEGIN — 折叠管线 v2（对齐 dsh-vscode webview/src/fold.ts；回归：node scripts/fold-regress.mjs） ====
+ * 事实源：交错 segments（text|thinking|tool 按真实到达顺序）。
+ * v2 关键点：chunkrow/text-chunks + chunkrow/reasoning-chunks（历史页正文压缩形态，
+ * texts[] 拼接——不接这两个 case 重载必丢正文）；tool/result 的 callId 三级取值
+ * （data.callId | data.message.source.callId | data.message.content[0].toolCallId）；
+ * 跨回合回溯（turn/end 后落地的结果仍能找到它的活动卡）；步骤卡（step/* → 📍）。 */
+class DshFold {
+    constructor() {
+        this.items = [];
+        this._lastSeq = -1;
+        this._firstSeq = -1;
+        this._turnCounter = 0;
+        this._running = false;
+    }
+    get seq() { return this._lastSeq; }
+    get oldestSeq() { return this._firstSeq; }
+    get isRunning() { return this._running; }
+    /** 收一条：mux 帧（session/event）/ 历史条目（{event,view?}）/ 裸事件。 */
+    push(entryOrEvent) {
+        const anyE = entryOrEvent;
+        let ev; let view;
+        if (anyE && anyE.type === "session/event" && anyE.event && typeof anyE.event === "object") {
+            ev = anyE.event; view = anyE;
+        } else if (anyE && anyE.event && typeof anyE.event === "object") {
+            ev = anyE.event; view = anyE;
+        } else {
+            ev = anyE;
+        }
+        if (!ev || typeof ev.type !== "string") return;
+        if (typeof ev.seq === "number") {
+            if (ev.seq <= this._lastSeq) return; // WS 重连/历史重叠去重
+            if (this._firstSeq < 0) this._firstSeq = ev.seq;
+            this._lastSeq = ev.seq;
+        }
+        switch (ev.type) {
+            case "user/message": {
+                const r = foldExtractUserPayload(ev.data);
+                if (r.text || (r.files && r.files.length) || (r.images && r.images.length)) {
+                    this.items.push({ kind: "user", key: `u${this._lastSeq}-${this.items.length}`, text: r.text, files: r.files, images: r.images });
+                }
+                break;
+            }
+            case "turn/start": {
+                this._running = true;
+                this._turnCounter += 1;
+                this.items.push({ kind: "turn", key: `t${this._turnCounter}-${this._lastSeq}`, text: "", thinking: "", activities: [], segments: [], ended: false, turnNo: this._turnCounter });
+                break;
+            }
+            case "turn/end": {
+                this._running = false;
+                const cur = this._currentTurn();
+                if (cur) { cur.ended = true; cur.liveTool = undefined; cur.lastSeq = this._lastSeq; }
+                break;
+            }
+            case "assistant/chunk": {
+                this._applyChunk(ev.data && ev.data.chunk, view);
+                break;
+            }
+            // 历史回放（session/page）把 text/reasoning 压成 chunkrow 行；text-delta 不持久化。
+            case "chunkrow/text-chunks": {
+                const texts = ev.data && ev.data.texts;
+                if (Array.isArray(texts) && texts.length > 0) this._appendSeg("text", texts.join(""));
+                break;
+            }
+            case "chunkrow/reasoning-chunks": {
+                const texts = ev.data && ev.data.texts;
+                if (Array.isArray(texts) && texts.length > 0) this._appendSeg("thinking", texts.join(""));
+                break;
+            }
+            case "assistant/message": {
+                const cur = this._currentTurn();
+                if (cur && !cur.text) {
+                    const m = (ev.data && (ev.data.message || ev.data.content)) || ev.data;
+                    const mt = typeof m === "string" ? m : (m && m.content);
+                    if (typeof mt === "string") cur.text = stripSystemContext(mt);
+                }
+                break;
+            }
+            case "tool/call": {
+                const d = (ev.data || {});
+                const args = foldParseJson(d.arguments);
+                const meta = foldSubagentMeta(d.name, args);
+                this._toolActivity({
+                    key: String(d.callId != null ? d.callId : `tc${this._lastSeq}`),
+                    name: meta ? meta.displayName : d.name,
+                    args,
+                    label: meta ? meta.label : String(d.name || "工具"),
+                });
+                break;
+            }
+            case "tool/result": {
+                const d = (ev.data || {});
+                const preview = foldExtractResultPreview(d, view && view.view);
+                const isError = foldIsErrorResult(d);
+                this._finishTool(foldResultCallId(d), preview, isError);
+                break;
+            }
+            case "step/start": {
+                const d = (ev.data || {});
+                const key = `st:${d.id != null ? d.id : `${d.turn != null ? d.turn : "?"}-${d.step != null ? d.step : "?"}`}`;
+                this._toolActivity({ key, name: d.title || d.name, label: `📍 ${d.title || d.name || `步骤 ${d.step != null ? d.step : ""}`}`.trim() });
+                break;
+            }
+            case "step/end": {
+                const d = (ev.data || {});
+                const key = `st:${d.id != null ? d.id : `${d.turn != null ? d.turn : "?"}-${d.step != null ? d.step : "?"}`}`;
+                this._finishTool(key, "", false);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    pushMany(entries) { for (const e of (entries || [])) this.push(e); }
+    /** 前插更早的历史页（条目按时间正序到达）。 */
+    unshiftMany(entries) {
+        const scratch = new DshFold();
+        scratch.pushMany(entries);
+        if (scratch.oldestSeq >= 0 && (this._firstSeq < 0 || scratch.oldestSeq < this._firstSeq)) {
+            this._firstSeq = scratch.oldestSeq;
+        }
+        this.items = [...scratch.items, ...this.items];
+    }
+    reset() {
+        this.items = []; this._lastSeq = -1; this._firstSeq = -1; this._turnCounter = 0; this._running = false;
+    }
+    _applyChunk(chunk, view) {
+        if (!chunk || typeof chunk.type !== "string") return;
+        this._ensureTurn(); // turn/start 之前的早到 chunk 也归一轮
+        switch (chunk.type) {
+            case "text-delta":
+                if (typeof chunk.text === "string") this._appendSeg("text", chunk.text);
+                break;
+            case "reasoning-delta":
+                if (typeof chunk.text === "string") this._appendSeg("thinking", chunk.text);
+                break;
+            case "usage":
+            case "finish":
+                break; // 纯元数据
+            case "tool-call":
+            case "tool-call-delta": {
+                const name = chunk.name != null ? chunk.name : chunk.toolName;
+                const args = foldParseJson(chunk.arguments != null ? chunk.arguments : (chunk.args != null ? chunk.args : chunk.input));
+                const meta = foldSubagentMeta(name, args);
+                this._toolActivity({
+                    key: String(chunk.callId != null ? chunk.callId : (chunk.toolCallId != null ? chunk.toolCallId : (chunk.id != null ? chunk.id : `c${this._lastSeq}`))),
+                    name: meta ? meta.displayName : name,
+                    args,
+                    label: meta ? meta.label : String(name || "工具"),
+                });
+                break;
+            }
+            case "tool-result":
+            case "tool-call-result": {
+                const preview = foldExtractResultPreview(chunk, view && view.view);
+                const isError = foldIsErrorResult(chunk);
+                this._finishTool(foldResultCallId(chunk), preview, isError);
+                break;
+            }
+            case "agent-start":
+                this._toolActivity({ key: `ag:${chunk.agentId != null ? chunk.agentId : (chunk.id != null ? chunk.id : this._lastSeq)}`, name: chunk.name, label: `👤 Agent ${chunk.name || ""}` });
+                break;
+            case "agent-end":
+                this._finishTool(`ag:${chunk.agentId != null ? chunk.agentId : (chunk.id != null ? chunk.id : "")}`, foldResultPreviewOf(chunk.result), !!chunk.error);
+                break;
+            case "subagent-start":
+                this._toolActivity({
+                    key: `sa:${chunk.subagentId != null ? chunk.subagentId : (chunk.id != null ? chunk.id : this._lastSeq)}`,
+                    name: chunk.name != null ? chunk.name : chunk.agentId,
+                    label: `👥 子代理 ${chunk.name || chunk.agentId || ""}${chunk.task ? `（${String(chunk.task).slice(0, 30)}）` : ""}`,
+                });
+                break;
+            case "subagent-end":
+                this._finishTool(`sa:${chunk.subagentId != null ? chunk.subagentId : (chunk.id != null ? chunk.id : "")}`, foldResultPreviewOf(chunk.result), !!chunk.error);
+                break;
+            case "step-start":
+                this._toolActivity({ key: `st:${chunk.id != null ? chunk.id : this._lastSeq}`, name: chunk.title, label: `📍 ${chunk.title || chunk.name || "步骤"}` });
+                break;
+            case "step-end":
+                this._finishTool(`st:${chunk.id != null ? chunk.id : ""}`, "", false);
+                break;
+            case "block-start":
+            case "block-end":
+                break; // 噪音
+            default:
+                break;
+        }
+    }
+    _ensureTurn() {
+        let cur = this._currentTurn();
+        if (!cur || cur.ended) {
+            this._turnCounter += 1;
+            cur = { kind: "turn", key: `t${this._turnCounter}-${this._lastSeq}`, text: "", thinking: "", activities: [], segments: [], ended: false, turnNo: this._turnCounter };
+            this.items.push(cur);
+            this._running = true;
+        }
+        return cur;
+    }
+    /** 同类尾段拼接，异类新开——segments 保持真实到达顺序（text→tool→text 就按这个序渲染）。 */
+    _appendSeg(kind, delta) {
+        const cur = this._ensureTurn();
+        if (kind === "text") cur.text += delta;
+        else cur.thinking += delta;
+        const last = cur.segments[cur.segments.length - 1];
+        if (last && last.kind === kind) last.text += delta;
+        else cur.segments.push(kind === "text" ? { kind: "text", text: delta } : { kind: "thinking", text: delta });
+    }
+    _currentTurn() {
+        for (let i = this.items.length - 1; i >= 0; i--) {
+            const it = this.items[i];
+            if (it.kind === "user") return undefined;
+            if (it.kind === "turn") return it;
+        }
+        return undefined;
+    }
+    _toolActivity(init) {
+        const cur = this._ensureTurn();
+        const existing = cur.activities.find((a) => a.key === init.key);
+        if (existing) {
+            if (init.name) existing.name = init.name;
+            if (init.args !== undefined) existing.args = init.args;
+            return;
+        }
+        const act = {
+            key: init.key,
+            kind: init.kind != null ? init.kind : (init.label.startsWith("👥") ? "subagent" : (init.label.startsWith("👤") ? "agent" : (init.label.startsWith("📍") ? "step" : "tool"))),
+            label: init.label,
+            detail: foldArgsPreview(init.args),
+            state: "running",
+            callId: init.key,
+            name: init.name,
+            args: init.args,
+        };
+        cur.activities.push(act);
+        cur.segments.push({ kind: "tool", act });
+        cur.liveTool = act.name ? `${act.name}${act.detail ? ` · ${act.detail.slice(0, 60)}` : ""}` : act.label;
+    }
+    _finishTool(key, preview, isError) {
+        if (!key) return;
+        // 先当前轮，再有限回溯——turn/end 之后才落地的结果也要能找到它的活动卡
+        const turns = [];
+        for (let i = this.items.length - 1; i >= 0 && turns.length < 5; i--) {
+            const it = this.items[i];
+            if (it.kind === "turn") turns.push(it);
+        }
+        for (const turn of turns) {
+            const act = turn.activities.find((a) => a.key === key);
+            if (act) {
+                act.state = isError ? "error" : "done";
+                if (preview) act.resultPreview = preview;
+                break;
+            }
+        }
+        const turn = turns[0];
+        if (!turn) return;
+        for (let i = turn.activities.length - 1; i >= 0; i--) {
+            const a = turn.activities[i];
+            if (a.state === "running") { turn.liveTool = a.name ? `${a.name}${a.detail ? ` · ${a.detail.slice(0, 60)}` : ""}` : a.label; return; }
+        }
+        turn.liveTool = undefined;
+    }
+}
+
+/** 子代理伪装成普通 tool/call（name=subagent/workflow/ralph/…）→ 👥 换脸 */
+function foldSubagentMeta(name, args) {
+    const n = typeof name === "string" ? name.toLowerCase() : "";
+    if (!["subagent", "subagent_fork", "ralph", "workflow", "agent_teams_add_member"].includes(n)) return null;
+    const a = args || {};
+    const desc =
+        (typeof a.description === "string" && a.description) ||
+        (typeof a.prompt === "string" ? a.prompt.split("\n", 1)[0].slice(0, 40) : "") ||
+        (typeof a.objective === "string" ? a.objective.split("\n", 1)[0].slice(0, 40) : "") ||
+        "";
+    return { label: `👥 子代理${desc ? ` · ${desc.slice(0, 50)}` : ""}`, displayName: desc.slice(0, 50) || String(name) };
+}
+
+function foldArgsPreview(args) {
+    if (args === undefined) return "";
+    try {
+        const s = typeof args === "string" ? args : JSON.stringify(args);
+        return s.length > 160 ? `${s.slice(0, 160)}…` : s;
+    } catch (_e) { return ""; }
+}
+
+function foldResultPreviewOf(result) {
+    if (result === undefined || result === null) return undefined;
+    try {
+        const s = typeof result === "string" ? result : JSON.stringify(result);
+        return s.length > 200 ? `${s.slice(0, 200)}…` : s;
+    } catch (_e) { return undefined; }
+}
+
+/** wire fact（rc.2 + alpha.5 实测）：tool/result 的 callId 在 data.callId、
+ *  data.message.source.callId 或 data.message.content[0].toolCallId —— 三级都收。 */
+function foldResultCallId(d) {
+    return String(
+        (d && (d.callId != null ? d.callId : (d.toolCallId != null ? d.toolCallId
+            : (d.message && d.message.source && d.message.source.callId)))) ||
+        (d && d.message && d.message.content && d.message.content[0] && d.message.content[0].toolCallId) ||
+        (d && d.id) || ""
+    );
+}
+
+function foldExtractResultPreview(data, view) {
+    const d = data || {};
+    const text =
+        (d.message && d.message.content && d.message.content[0] && d.message.content[0].content && d.message.content[0].content[0] && d.message.content[0].content[0].text) ||
+        (d.message && d.message.content && d.message.content[0] && d.message.content[0].text) ||
+        (d.content && d.content[0] && d.content[0].text) ||
+        d.text;
+    if (typeof text === "string" && text) return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+    if (view && typeof view.card === "string") {
+        return view.card.length > 200 ? `${view.card.slice(0, 200)}…` : view.card;
+    }
+    return foldResultPreviewOf(d.result);
+}
+
+function foldIsErrorResult(data) {
+    const d = data || {};
+    if (d.isError === true) return true;
+    const content = d.message && d.message.content && d.message.content[0];
+    return !!(content && content.isError === true);
+}
+
+function foldParseJson(raw) {
+    if (typeof raw !== "string") return raw;
+    try { return JSON.parse(raw); } catch (_e) { return undefined; }
+}
+
+/** user/message → (人类文本, 附件标签, 图片)。引用文件部件只留标签不留正文。 */
+function foldExtractUserPayload(data) {
+    const d = data || {};
+    const parts = [];
+    const files = [];
+    const images = [];
+    const consider = (t) => {
+        const m = /^\[引用文件 (.+?)\]\n?/.exec(String(t).trim());
+        if (m) { files.push(m[1]); return; }
+        parts.push(t);
+    };
+    if (typeof d.text === "string") consider(d.text);
+    else if (Array.isArray(d.content)) {
+        for (const c of d.content) {
+            if (c && c.type === "image" && c.attachment && typeof c.attachment.attachmentId === "string" && c.attachment.attachmentId) {
+                images.push({ attachmentId: c.attachment.attachmentId, mediaType: c.attachment.mediaType || "image/png", name: c.attachment.name });
+                continue;
+            }
+            if (c && typeof c.text === "string" && c.text) consider(c.text);
+        }
+    } else if (typeof d.content === "string") consider(d.content);
+    const raw = parts.join("\n\n");
+    // 指令注入（AGENTS.md/技能文档）以独立多段文档到达：首段是指令头 → 整条丢弃
+    const firstLine = ((raw.split(/\n\s*\n/, 1)[0] || "").split("\n", 1)[0] || "").trim();
+    if (/^Instructions from\b/.test(firstLine)) return { text: "", files, images };
+    return { text: stripSystemContext(raw), files, images };
+}
+/* ==== FOLD-PURE-END ==== */
+
 // 入口：先剥系统块，再走 v0.5.0 同款结构化切分——fence 段重排成规范 dsh-ui 代码块；
 // 纯文本段保留 wrapDshUiJson 兜底（无栏裸 JSON 自动包栏，Obsidian 原有能力不回退）
 function preprocessAssistantText(text) {
@@ -3785,10 +4143,14 @@ class DshNativeView extends ItemView {
         // vscode fold.ts：block-* 直接 ignore；这里保持一致，避免流式每段都多一张卡片
         if (t === "block-start" || t === "block-end") return;
         const data = (chunk && chunk.data) || {};
+        // v2（fold.ts 对齐）：tool/result 的 callId 可嵌套在 message.source.callId
+        // 或 message.content[0].toolCallId —— 只读顶层会让活动卡永远转圈。
+        const nestedCallId = (data.message && data.message.source && data.message.source.callId)
+            || (data.message && data.message.content && data.message.content[0] && data.message.content[0].toolCallId);
         // 关键修复：fallback id 去掉 Math.random —— 否则每个流式 tool-call-delta 都会被当成新工具
         // 改为 type+name 合并（同一 type+name 的所有 delta 折成一行）
         const id = String(
-            data.toolCallId || data.callId || data.id
+            data.toolCallId || data.callId || nestedCallId || data.id
             || data.agentId || data.subagentId || data.sessionId
             || (t + ":" + (data.name || data.toolName || ""))
         );
@@ -3818,7 +4180,9 @@ class DshNativeView extends ItemView {
             this.scrollToBottom();
             return;
         }
-        const finished = t.endsWith("-end");
+        // v2 修复：tool-result / tool-call-result 也是完结信号（原只认 *-end →
+        // 工具结果到达后活动卡永远转圈，即 VSCode 0.11 同款 bug）。
+        const finished = t.endsWith("-end") || t === "tool-result" || t === "tool-call-result";
         const label = (() => {
             if (t.startsWith("tool-")) {
                 // 子代理伪装成 tool/call：换脸成 👥 子代理（Bug 4 核心修复）
@@ -3864,13 +4228,23 @@ class DshNativeView extends ItemView {
             row.root.removeClass("is-active"); row.root.addClass("is-done");
             row.finished = true;
             try {
-                if (data.result != null) {
-                    row._result = typeof data.result === "string" ? data.result : JSON.stringify(data.result, null, 2);
+                // v2（fold.ts 对齐）：结果文本可嵌套在 message.content[0].content[0].text
+                const nestedText = (data.message && data.message.content && data.message.content[0]
+                    && ((data.message.content[0].content && data.message.content[0].content[0] && data.message.content[0].content[0].text)
+                        || data.message.content[0].text));
+                const resultSrc = nestedText != null ? nestedText
+                    : (data.result != null ? data.result
+                        : (data.content && data.content[0] && data.content[0].text));
+                if (resultSrc != null) {
+                    row._result = typeof resultSrc === "string" ? resultSrc : JSON.stringify(resultSrc, null, 2);
                     const preview = row._result.slice(0, 200);
                     if (preview) row.detail.textContent = " — " + preview.replace(/\s+/g, " ");
                 } else if (data.error) {
                     row._result = "出错：" + String(data.error);
                     row.detail.textContent = " — " + row._result.slice(0, 200);
+                } else if (foldIsErrorResult(data)) {
+                    row._result = "工具执行出错";
+                    row.detail.textContent = " — 工具执行出错";
                 }
             } catch (_e) { /* 忽略序列化失败 */ }
             if (row._open) this._renderActivityBody(row);
@@ -4189,6 +4563,13 @@ class DshNativeView extends ItemView {
                 if (!ch) continue;
                 if (ch.type === "text-delta" && typeof ch.text === "string") text += ch.text;
                 else if (ch.type === "reasoning-delta" && typeof ch.text === "string") thinking += ch.text;
+            } else if (ev.type === "chunkrow/text-chunks") {
+                // v012 历史页正文压缩形态（texts[] 拼接）
+                const texts = ev.data && ev.data.texts;
+                if (Array.isArray(texts)) text += texts.join("");
+            } else if (ev.type === "chunkrow/reasoning-chunks") {
+                const texts = ev.data && ev.data.texts;
+                if (Array.isArray(texts)) thinking += texts.join("");
             } else if (ev.type === "assistant/message") {
                 // 退化：个别版本把整段回复放在 assistant/message
                 const m = ev.data && (ev.data.message || ev.data.content || ev.data);
@@ -4314,36 +4695,114 @@ class DshNativeView extends ItemView {
     }
 
     _eventsToItems(events) {
-        // 把 WS/历史 events 重建成 user / assistant(turn) 条目（与 VSCode fold 同逻辑）
-        const items = [];
-        let buf = null;
-        for (const e of events) {
-            const ev = e.event || {};
-            if (ev.type === "user/message") {
-                items.push({ role: "user", ev });
-            } else if (ev.type === "turn/start") {
-                buf = { text: "", thinking: "" };
-            } else if (ev.type === "assistant/chunk" && buf) {
-                const ch = ev.data && ev.data.chunk;
-                if (!ch) continue;
-                if (ch.type === "text-delta" && typeof ch.text === "string") buf.text += ch.text;
-                else if (ch.type === "reasoning-delta" && typeof ch.text === "string") buf.thinking += ch.text;
-            } else if (ev.type === "assistant/message" && buf && !buf.text) {
-                const m = ev.data && (ev.data.message || ev.data.content || ev.data);
-                const mt = typeof m === "string" ? m : (m && m.content);
-                if (typeof mt === "string") buf.text = mt;
-            } else if (ev.type === "turn/end" && buf) {
-                items.push({ role: "assistant", text: buf.text, thinking: buf.thinking });
-                buf = null;
-            }
-        }
-        if (buf) items.push({ role: "assistant", text: buf.text, thinking: buf.thinking });
-        return items;
+        // v2：走 DshFold（交错段 + chunkrow + 嵌套 callId + 步骤卡 + 跨回合回溯）
+        const fold = new DshFold();
+        fold.pushMany(events || []);
+        return fold.items.map((it) => (it.kind === "user"
+            ? { role: "user", text: it.text, files: it.files }
+            : { role: "assistant", turn: it }));
     }
 
     _renderHistoryItem(it, atTop) {
-        if (it.role === "user") this.addUserBubbleFromEvent(it.ev, atTop);
-        else this.renderStaticAssistant(it.text, it.thinking, atTop);
+        if (it.role === "user") this.addUserBubbleFromEvent({ data: { text: it.text } }, atTop);
+        else this.renderStaticTurn(it.turn, atTop);
+    }
+
+    /** 历史回合气泡：按 segments 真实到达顺序渲染（正文/思考/活动卡交错，
+     *  对齐 VSCode fold v2 —— 不再把工具全抹掉、不会思考正文错位）。 */
+    renderStaticTurn(turn, atTop = false) {
+        const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-assistant");
+        bubble.createDiv("dsh-msg-role").textContent = "DSH";
+        const content = bubble.createDiv("dsh-msg-content");
+        this.renderFoldSegments(content, turn);
+        if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
+    }
+
+    /** 交错段渲染：text→围栏切分+Markdown；thinking→折叠块；tool→活动行。 */
+    async renderFoldSegments(contentEl, turn) {
+        const segs = (turn && turn.segments) || [];
+        let holder = null;
+        const ensureHolder = () => {
+            if (!holder) holder = contentEl.createDiv("dsh-activities");
+            return holder;
+        };
+        if (segs.length === 0) {
+            // 空段兜底：整轮按「思考+正文」整段渲染（老路径）
+            await this.renderThinkingAndText(contentEl, (turn && turn.text) || "", (turn && turn.thinking) || "", true);
+            return;
+        }
+        for (const seg of segs) {
+            if (seg.kind === "tool") {
+                this.renderFoldActivityRow(ensureHolder(), seg.act);
+            } else if (seg.kind === "thinking") {
+                const clean = stripSystemContext(seg.text || "") || "";
+                if (!clean.trim()) continue;
+                const det = contentEl.createEl("details", { cls: "dsh-thinking" });
+                det.createEl("summary").textContent = "💭 思考过程";
+                const tw = det.createDiv("dsh-thinking-body");
+                await MarkdownRenderer.render(this.app, clean, tw, "", this);
+                this.postProcessDshUi(tw, true);
+            } else {
+                const s = stripSystemContext(seg.text || "");
+                if (!s.trim()) continue;
+                const body = contentEl.createDiv("dsh-msg-md");
+                for (const fs of splitDshUiSegments(s)) {
+                    if (fs.kind === "fence") this.renderDshUiSegment(body, fs.text, true);
+                    else {
+                        const segDiv = body.createDiv();
+                        await MarkdownRenderer.render(this.app, wrapDshUiJson(fs.text), segDiv, "", this);
+                        this.postProcessDshUi(segDiv, true);
+                    }
+                }
+            }
+        }
+    }
+
+    /** 静态活动行（历史回放用；与实时 appendActivity 同一套样式类，默认折叠 args/结果）。 */
+    renderFoldActivityRow(holder, act) {
+        if (!act) return;
+        const MAX = 5;
+        if (holder.childElementCount >= MAX) {
+            let summary = holder.querySelector(".dsh-activity-overflow");
+            if (!summary) {
+                summary = holder.createDiv("dsh-activity dsh-activity-overflow");
+                summary.createSpan("dsh-activity-icon").textContent = "📦";
+                summary.createSpan("dsh-activity-text").textContent = "更多活动";
+                summary.createSpan("dsh-activity-detail").className = "dsh-activity-detail";
+            }
+            const d = summary.querySelector(".dsh-activity-detail") || summary.createSpan("dsh-activity-detail");
+            const n = holder.querySelectorAll(".dsh-activity:not(.dsh-activity-overflow)").length - MAX + 1;
+            d.textContent = ` — 已折叠 ${Math.max(n, 1)} 个活动`;
+            return;
+        }
+        const row = holder.createDiv(`dsh-activity ${act.state === "running" ? "is-active" : act.state === "error" ? "is-error" : "is-done"}`);
+        const head = row.createDiv("dsh-activity-head");
+        head.createSpan("dsh-activity-icon").textContent = act.state === "error" ? "❌" : act.state === "running" ? "⏳" : act.kind === "step" ? "📍" : "✅";
+        head.createSpan("dsh-activity-text").textContent = act.label;
+        const detail = head.createSpan("dsh-activity-detail");
+        const prev = act.resultPreview || act.detail || "";
+        if (prev) detail.textContent = " — " + String(prev).replace(/\s+/g, " ").slice(0, 200);
+        const argsStr = act.args != null ? (typeof act.args === "string" ? act.args : (() => { try { return JSON.stringify(act.args, null, 2); } catch (_e) { return ""; } })()) : "";
+        if (argsStr || act.resultPreview) {
+            const body = row.createDiv("dsh-activity-body");
+            body.style.display = "none";
+            if (argsStr) {
+                body.createDiv("dsh-activity-body-label").textContent = "参数";
+                body.createEl("pre", { cls: "dsh-activity-body-pre" }).textContent = argsStr;
+            }
+            if (act.resultPreview) {
+                body.createDiv("dsh-activity-body-label").textContent = "结果";
+                body.createEl("pre", { cls: "dsh-activity-body-pre" }).textContent = act.resultPreview;
+            }
+            const chev = head.createSpan("dsh-activity-chev");
+            chev.textContent = "▸";
+            let open = false;
+            head.addEventListener("click", () => {
+                open = !open;
+                body.style.display = open ? "" : "none";
+                chev.textContent = open ? "▾" : "▸";
+            });
+        }
     }
 
     // 向上翻页：拉取比当前最旧事件更早的一批历史
@@ -4628,6 +5087,54 @@ class DshNativeView extends ItemView {
                 // 全量对账：400ms 后从权威 history 重建，消除增量渲染累积的所有错误
                 this.scheduleReconcile();
                 break;
+            // ---- 持久事件（历史页/实时都可能到达；v2 折叠管线对齐）----
+            case "chunkrow/text-chunks": {
+                // 历史页正文压缩形态：texts[] 拼接（不接必丢正文）
+                const texts = ev.data && ev.data.texts;
+                if (Array.isArray(texts) && texts.length) {
+                    this._contentSetByWs = true;
+                    this._gotAssistantChunks = true;
+                    this.appendAssistant(texts.join(""), false);
+                }
+                break;
+            }
+            case "chunkrow/reasoning-chunks": {
+                const texts = ev.data && ev.data.texts;
+                if (Array.isArray(texts) && texts.length) {
+                    this._contentSetByWs = true;
+                    this.appendAssistant(texts.join(""), true);
+                }
+                break;
+            }
+            case "tool/call": {
+                const d = ev.data || {};
+                this.appendActivity({ type: "tool-call", data: { callId: d.callId, name: d.name, toolName: d.name, args: d.arguments != null ? d.arguments : d.args } });
+                break;
+            }
+            case "tool/result": {
+                const d = ev.data || {};
+                const preview = foldExtractResultPreview(d, undefined);
+                this.appendActivity({
+                    type: "tool-result",
+                    data: {
+                        callId: foldResultCallId(d),
+                        toolCallId: foldResultCallId(d),
+                        result: preview,
+                        error: foldIsErrorResult(d) ? "工具执行出错" : undefined,
+                    },
+                });
+                break;
+            }
+            case "step/start": {
+                const d = ev.data || {};
+                this.appendActivity({ type: "step-start", data: { id: d.id, title: d.title || d.name, step: d.step } });
+                break;
+            }
+            case "step/end": {
+                const d = ev.data || {};
+                this.appendActivity({ type: "step-end", data: { id: d.id } });
+                break;
+            }
             default:
                 break;
         }
@@ -5210,7 +5717,7 @@ class DshNativePlugin extends Plugin {
         this._detecting = false;
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.2.0-" + new Date().toISOString();
+        const BUILD_TAG = "dsh-native-v0.3.0-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
