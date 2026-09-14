@@ -213,6 +213,32 @@ select.dsh-chip-btn { max-width: 220px; }
 }
 .dsh-msg-content p:first-child { margin-top: 0; }
 .dsh-msg-content p:last-child { margin-bottom: 0; }
+
+/* v0.7.1 回合失败可见化：失败回合不再只剩空气泡，错误块是这一轮唯一的可见输出 */
+.dsh-turn-error {
+    margin: 8px 0 2px;
+    padding: 8px 12px;
+    border-left: 3px solid var(--text-error, #e93147);
+    border-radius: var(--radius-s);
+    background: var(--background-modifier-error, rgba(233, 49, 71, 0.1));
+}
+.dsh-turn-error-title {
+    font-size: var(--font-ui-smaller);
+    font-weight: 600;
+    color: var(--text-error, #e93147);
+    margin-bottom: 4px;
+}
+.dsh-turn-error-body {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-normal);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+.dsh-turn-error-hint {
+    margin-top: 6px;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-faint);
+}
 .dsh-msg-content pre {
     background: var(--code-background);
     border: 1px solid var(--background-modifier-border);
@@ -570,11 +596,24 @@ select.dsh-chip-btn { max-width: 220px; }
     border-top: 1px dashed var(--background-modifier-border);
 }
 .dsh-question-item:first-child { border-top: none; }
+/* v0.7.1：header 短标题 / detail 支持说明（DSH AskUserQuestionItem 字段） */
+.dsh-question-header {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+}
+.dsh-question-detail {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
 .dsh-question-label { font-size: var(--font-ui-small); color: var(--text-normal); font-weight: 500; }
 .dsh-question-options { display: flex; flex-direction: column; gap: 2px; }
 .dsh-question-option {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 6px;
     padding: 2px 4px;
     border-radius: 4px;
@@ -583,6 +622,14 @@ select.dsh-chip-btn { max-width: 220px; }
 .dsh-question-option:hover { background: var(--background-modifier-hover); }
 .dsh-question-option input { flex: 0 0 auto; margin: 0; }
 .dsh-question-option-text { font-size: var(--font-ui-smaller); color: var(--text-normal); }
+/* 选项说明：换行到第二行，缩进对齐 label 文字（与 VSCode/dsh GUI 的选项卡片一致） */
+.dsh-question-option-desc {
+    flex: 0 0 100%;
+    padding-left: 22px;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    line-height: 1.5;
+}
 .dsh-question-custom {
     width: 100%;
     min-height: auto;

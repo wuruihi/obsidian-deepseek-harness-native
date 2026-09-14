@@ -15,7 +15,14 @@
  *   session/event: turn/start, step/start, assistant/chunk{chunk:{type:text|reasoning|block|usage|final,text}}, assistant/message, step/end, turn/end
  *   session/projection: title, sessionStats, tokenUsage, contextPressure ...
  *   approval/requested{approvalId,toolName,reason?} -> respond {sessionId, approvalId, outcome}
- *   question/requested{questions}                   -> respond {sessionId, answer:{answers:[...]}}
+ *   question/requested{questions:[{id,question,header?,detail?,options:[{label,description?}],multiSelect?}]}
+ *                                                -> respond {sessionId, answer:{answers:[{id,selected:[label…],custom?}]}}
+ *
+ * 0.1.5 事件形状变更（v0.7.2 适配，实测抓包）：
+ *   - 助手正文：assistant/message.data.message.content = [{type:"text"|"reasoning"|"tool-call",text}]（**数组**，
+ *     旧版是整段字符串）；且该轮不再有 assistant/chunk 流式帧。
+ *   - 事件次序：turn/start → user/message(kind=user) → 注入帧 → assistant/message → turn/end。
+ *     即人类消息落在 turn/start **之后**——不能再用 user 项当回合边界（会把正文丢掉、turn/end 漏标）。
  */
 
 const {
@@ -2268,20 +2275,35 @@ class DshFold {
             case "user/message": {
                 const r = foldExtractUserPayload(ev.data);
                 if (r.text || (r.files && r.files.length) || (r.images && r.images.length)) {
-                    this.items.push({ kind: "user", key: `u${this._lastSeq}-${this.items.length}`, text: r.text, files: r.files, images: r.images });
+                    const item = { kind: "user", key: `u${this._lastSeq}-${this.items.length}`, text: r.text, files: r.files, images: r.images };
+                    // 0.1.5 次序：人类消息事件出现在 turn/start **之后**。直接 push 会让「助手回复」排在
+                    // 「用户气泡」上面（甚至被当成回合边界丢掉），所以插到当前未结束回合之前。
+                    const open = this._openTurn();
+                    const at = open ? this.items.lastIndexOf(open) : -1;
+                    if (at >= 0) this.items.splice(at, 0, item);
+                    else this.items.push(item);
                 }
                 break;
             }
             case "turn/start": {
                 this._running = true;
+                // 上一回合若没等到 turn/end（丢帧/中断），先收口，避免它吞掉本轮内容
+                const stale = this._openTurn();
+                if (stale) { stale.ended = true; stale.liveTool = undefined; }
                 this._turnCounter += 1;
                 this.items.push({ kind: "turn", key: `t${this._turnCounter}-${this._lastSeq}`, text: "", thinking: "", activities: [], segments: [], ended: false, turnNo: this._turnCounter });
                 break;
             }
             case "turn/end": {
                 this._running = false;
-                const cur = this._currentTurn();
-                if (cur) { cur.ended = true; cur.liveTool = undefined; cur.lastSeq = this._lastSeq; }
+                const cur = this._openTurn();
+                if (cur) {
+                    cur.ended = true; cur.liveTool = undefined; cur.lastSeq = this._lastSeq;
+                    // v0.7.1 失败回合可见化：reason.kind==="error"（如 REQUEST_EXTENSION / 服务端 5xx）
+                    // 必须挂在回合上——否则渲染层只剩一个空气泡，用户会误判「发送没生效」。
+                    const fe = foldTurnError(ev.data);
+                    if (fe) cur.error = fe;
+                }
                 break;
             }
             case "assistant/chunk": {
@@ -2300,11 +2322,22 @@ class DshFold {
                 break;
             }
             case "assistant/message": {
-                const cur = this._currentTurn();
-                if (cur && !cur.text) {
-                    const m = (ev.data && (ev.data.message || ev.data.content)) || ev.data;
-                    const mt = typeof m === "string" ? m : (m && m.content);
-                    if (typeof mt === "string") cur.text = stripSystemContext(mt);
+                // 用 _ensureTurn：0.1.5 的 user/message 插在 turn/start 之后，按 user 找回合会找不到
+                const cur = this._ensureTurn();
+                // 0.1.5 形状：data.message.content = [{type:"text"|"reasoning"|"tool-call",…}]（数组！）
+                // legacy 形状：纯字符串 / {content:"…"}。只认字符串会让整条回复消失（面板空白气泡）。
+                const m = (ev.data && (ev.data.message || ev.data.content)) || ev.data;
+                const parts = (m && typeof m === "object" && m.content !== undefined) ? m.content : m;
+                const got = foldAssistantParts(parts);
+                const text = stripSystemContext(got.text || "");
+                if (text && !cur.text) {
+                    cur.text = text;
+                    // 必须进 segments：渲染层有 segments 时只按段渲染，只写 text 会「有正文但不显示」
+                    if (!cur.segments.some((s) => s.kind === "text")) cur.segments.push({ kind: "text", text });
+                }
+                if (got.thinking && !cur.thinking) {
+                    cur.thinking = got.thinking;
+                    if (!cur.segments.some((s) => s.kind === "thinking")) cur.segments.push({ kind: "thinking", text: got.thinking });
                 }
                 break;
             }
@@ -2428,8 +2461,8 @@ class DshFold {
         }
     }
     _ensureTurn() {
-        let cur = this._currentTurn();
-        if (!cur || cur.ended) {
+        let cur = this._openTurn();
+        if (!cur) {
             this._turnCounter += 1;
             cur = { kind: "turn", key: `t${this._turnCounter}-${this._lastSeq}`, text: "", thinking: "", activities: [], segments: [], ended: false, turnNo: this._turnCounter };
             this.items.push(cur);
@@ -2445,6 +2478,16 @@ class DshFold {
         const last = cur.segments[cur.segments.length - 1];
         if (last && last.kind === kind) last.text += delta;
         else cur.segments.push(kind === "text" ? { kind: "text", text: delta } : { kind: "thinking", text: delta });
+    }
+    /** 最近一个未结束的回合——**跨过插在回合中间的 user/message**（含注入帧剥剩的）。
+     *  0.1.5 次序是 turn/start → user/message → assistant/message，若把 user 当回合边界，
+     *  助手正文会找不到回合被丢弃、turn/end 也会漏标（面板整轮空白）。 */
+    _openTurn() {
+        for (let i = this.items.length - 1; i >= 0; i--) {
+            const it = this.items[i];
+            if (it.kind === "turn" && !it.ended) return it;
+        }
+        return undefined;
     }
     _currentTurn() {
         for (let i = this.items.length - 1; i >= 0; i--) {
@@ -2571,6 +2614,79 @@ function foldIsErrorResult(data) {
     return !!(content && content.isError === true);
 }
 
+/** v0.7.2 助手消息内容 → {text, thinking}。
+ *  DSH 0.1.5 形状：content = [{type:"text"|"reasoning"|"tool-call", text?}]（数组）；
+ *  legacy 形状：纯字符串 / {content:"…"}。
+ *  工具调用部件不算正文（另有 tool/call 事件负责活动卡），避免把 JSON 参数当回答显示。 */
+function foldAssistantParts(parts) {
+    if (typeof parts === "string") return { text: parts, thinking: "" };
+    if (!Array.isArray(parts)) return { text: "", thinking: "" };
+    let text = "";
+    let thinking = "";
+    for (const p of parts) {
+        if (typeof p === "string") { text += p; continue; }
+        if (!p || typeof p !== "object") continue;
+        const t = typeof p.text === "string" ? p.text : (typeof p.content === "string" ? p.content : "");
+        if (!t) continue;
+        const kind = p.type;
+        if (kind === "reasoning" || kind === "thinking" || kind === "reasoning-delta") thinking += t;
+        else if (kind === "text" || kind === "text-delta" || kind === undefined || kind === null) text += t;
+        // 其余（tool-call / tool-call-delta / …）不进正文
+    }
+    return { text, thinking };
+}
+
+/** 最新一个回合的正文/思考/是否结束/失败原因（轮询兜底 + catchup 判定用）。
+ *  与 DshFold 共用同一套形状处理：0.1.5 的 assistant/message 是 content 数组。 */
+function foldLatestTurn(events) {
+    if (!Array.isArray(events) || events.length === 0) return null;
+    let startIdx = -1;
+    for (let i = 0; i < events.length; i++) {
+        const t = events[i] && events[i].event && events[i].event.type;
+        if (t === "turn/start") startIdx = i;
+    }
+    if (startIdx < 0) return null;
+    let text = "";
+    let thinking = "";
+    let ended = false;
+    let error = null;
+    for (let i = startIdx; i < events.length; i++) {
+        const ev = (events[i] && events[i].event) || {};
+        if (ev.type === "turn/end") { ended = true; error = foldTurnError(ev.data) || error; }
+        else if (ev.type === "assistant/chunk") {
+            const ch = ev.data && ev.data.chunk;
+            if (!ch) continue;
+            if (ch.type === "text-delta" && typeof ch.text === "string") text += ch.text;
+            else if (ch.type === "reasoning-delta" && typeof ch.text === "string") thinking += ch.text;
+        } else if (ev.type === "chunkrow/text-chunks") {
+            const texts = ev.data && ev.data.texts;
+            if (Array.isArray(texts)) text += texts.join("");
+        } else if (ev.type === "chunkrow/reasoning-chunks") {
+            const texts = ev.data && ev.data.texts;
+            if (Array.isArray(texts)) thinking += texts.join("");
+        } else if (ev.type === "assistant/message") {
+            const m = ev.data && (ev.data.message || ev.data.content || ev.data);
+            const parts = (m && typeof m === "object" && m.content !== undefined) ? m.content : m;
+            const got = foldAssistantParts(parts);
+            if (!text && got.text) text = got.text;
+            if (!thinking && got.thinking) thinking = got.thinking;
+        }
+    }
+    return { text, thinking, ended, error };
+}
+
+/** v0.7.1 turn/end 的失败 reason → 可渲染的 {message, code}；正常结束/无 reason 返回 undefined。
+ *  DSH 形状：{turn, reason:{kind:"error", error:{message, code}}}（如 REQUEST_EXTENSION）。 */
+function foldTurnError(data) {
+    const reason = data && data.reason;
+    if (!reason || typeof reason !== "object" || reason.kind !== "error") return undefined;
+    const err = (reason.error && typeof reason.error === "object") ? reason.error : {};
+    const message = (typeof err.message === "string" && err.message)
+        ? err.message
+        : (typeof reason.message === "string" && reason.message ? reason.message : "回合以错误结束（服务端未提供详情）");
+    return { message, code: typeof err.code === "string" ? err.code : "" };
+}
+
 function foldParseJson(raw) {
     if (typeof raw !== "string") return raw;
     try { return JSON.parse(raw); } catch (_e) { return undefined; }
@@ -2604,6 +2720,42 @@ function foldExtractUserPayload(data) {
     return { text: stripSystemContext(raw), files, images };
 }
 /* ==== FOLD-PURE-END ==== */
+
+/* ==== QUESTION-PURE-BEGIN — 用户提问应答编码（回归：node scripts/question-regress.mjs） ====
+ * 契约（@deepseek-ai/dsh-user-questions 的 AskUserQuestionAnswer）：
+ *   { answers: [{ id: string, selected: string[]（选中项 label）, custom?: string }] }
+ * DSH 侧 `ask_user_question` 直接做 `[...answer.selected]`——selected 不是数组就会
+ * 抛 `Error: answer.selected is not iterable`（v0.7.1 之前的 bug：插件把答案拼成字符串）。
+ * 语义对齐 dsh-client-ui-user-questions 的 QuestionComposer.submitDrafts：
+ *   · 单选且自定义非空 → selected 清空、只留 custom（自定义覆盖选项）
+ *   · 多选 → selected 与 custom 并存
+ *   · id 必须回显提问方的 id；缺失才退化为序号（避免发 undefined 给服务端）
+ *   · selected 只允许题面 options 里的 label（题面给了选项时才做交集，挡脏值）
+ */
+function questionAnswerItem(question, draft, fallbackId) {
+    const q = (question && typeof question === "object") ? question : { question };
+    const id = typeof q.id === "string" && q.id ? q.id : String(fallbackId == null ? "" : fallbackId);
+    const raw = (draft && Array.isArray(draft.selected)) ? draft.selected : [];
+    const labels = (Array.isArray(q.options) ? q.options : [])
+        .map((o) => (typeof o === "string" ? o : (o && o.label) || ""))
+        .filter((l) => typeof l === "string" && l);
+    const selected = labels.length ? raw.filter((s) => typeof s === "string" && labels.includes(s)) : raw.filter((s) => typeof s === "string" && s);
+    const custom = (draft && typeof draft.custom === "string") ? draft.custom.trim() : "";
+    const multi = q.multiSelect === true || q.multi === true;
+    return {
+        id,
+        selected: (custom === "" || multi) ? selected : [],
+        ...(custom === "" ? {} : { custom }),
+    };
+}
+
+/** 整题作答：questions=服务端问题数组，drafts=每题 {selected:[],custom:""}。 */
+function questionAnswer(questions, drafts) {
+    const qs = Array.isArray(questions) ? questions : [];
+    const ds = Array.isArray(drafts) ? drafts : [];
+    return { answers: qs.map((q, i) => questionAnswerItem(q, ds[i], i)) };
+}
+/* ==== QUESTION-PURE-END ==== */
 
 // 入口：先剥系统块，再走 v0.5.0 同款结构化切分——fence 段重排成规范 dsh-ui 代码块；
 // 纯文本段保留 wrapDshUiJson 兜底（无栏裸 JSON 自动包栏，Obsidian 原有能力不回退）
@@ -5077,42 +5229,9 @@ class DshNativeView extends ItemView {
         }
     }
 
-    // 从 history 事件里抽取「最新一个 turn」的正文与思考（含是否结束）
-    extractLatestTurn(events) {
-        if (!Array.isArray(events) || events.length === 0) return null;
-        let startIdx = -1;
-        for (let i = 0; i < events.length; i++) {
-            const t = events[i].event && events[i].event.type;
-            if (t === "turn/start") startIdx = i;
-        }
-        if (startIdx < 0) return null;
-        let text = "";
-        let thinking = "";
-        let ended = false;
-        for (let i = startIdx; i < events.length; i++) {
-            const ev = events[i].event || {};
-            if (ev.type === "turn/end") { ended = true; }
-            else if (ev.type === "assistant/chunk") {
-                const ch = ev.data && ev.data.chunk;
-                if (!ch) continue;
-                if (ch.type === "text-delta" && typeof ch.text === "string") text += ch.text;
-                else if (ch.type === "reasoning-delta" && typeof ch.text === "string") thinking += ch.text;
-            } else if (ev.type === "chunkrow/text-chunks") {
-                // v012 历史页正文压缩形态（texts[] 拼接）
-                const texts = ev.data && ev.data.texts;
-                if (Array.isArray(texts)) text += texts.join("");
-            } else if (ev.type === "chunkrow/reasoning-chunks") {
-                const texts = ev.data && ev.data.texts;
-                if (Array.isArray(texts)) thinking += texts.join("");
-            } else if (ev.type === "assistant/message") {
-                // 退化：个别版本把整段回复放在 assistant/message
-                const m = ev.data && (ev.data.message || ev.data.content || ev.data);
-                const mt = typeof m === "string" ? m : (m && m.content);
-                if (typeof mt === "string" && !text) text = mt;
-            }
-        }
-        return { text, thinking, ended };
-    }
+    // 从 history 事件里抽取「最新一个 turn」的正文与思考（含是否结束/失败原因）
+    // 实现是 FOLD-PURE 里的纯函数（与 DshFold 同一套形状处理，可回归）
+    extractLatestTurn(events) { return foldLatestTurn(events); }
 
     // 把最新 turn 的内容渲染进当前助手气泡（轮询兜底用，authoritative）
     renderAssistantFull(text, thinking) {
@@ -5139,6 +5258,14 @@ class DshNativeView extends ItemView {
                     turn.thinking.length > (this.thinkingMd || "").length;
                 if (turn.ended) {
                     if (this._turnDone) return;
+                    // v0.7.1 失败回合：可能完全没有正文（模型/服务端拒答），必须先把错误落到气泡再收尾，
+                    // 否则 hasContent 判定为空 → 一直轮询到 120s 才收尾，面板全程空白 = 用户以为「没生效」。
+                    if (turn.error) {
+                        this.surfaceTurnError(turn.error);
+                        this.finalizeAssistant();
+                        this.scheduleReconcile();
+                        return;
+                    }
                     // 空 turn（warmup 占位）不算真正结束：继续轮询等真实回复，否则会漏掉后续正文
                     const hasContent = turn.text || turn.thinking;
                     if (!hasContent) return;
@@ -5249,6 +5376,8 @@ class DshNativeView extends ItemView {
         bubble.createDiv("dsh-msg-role").textContent = "DSH";
         const content = bubble.createDiv("dsh-msg-content");
         this.renderFoldSegments(content, turn);
+        // v0.7.1 失败回合：正文可能是空的，错误块就是这一轮唯一的可见输出
+        if (turn && turn.error) this.renderTurnErrorBlock(content, turn.error);
         // v0.7.0 产物卡（对齐 VSCode ProducedCard：本轮成功变更的文件，点击打开）
         if (turn && Array.isArray(turn.produced) && turn.produced.length) {
             this.renderProducedCard(bubble, turn.produced);
@@ -5271,6 +5400,31 @@ class DshNativeView extends ItemView {
             }
         }
         if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
+    }
+
+    /** v0.7.1 回合失败可见化（对齐 DSH GUI 的 turn 报错行）：失败原因必须显示出来。
+     *  历史回放 / turn 结束后对账重建走这里；实时路径走 surfaceTurnError()。 */
+    renderTurnErrorBlock(parentEl, err) {
+        if (!parentEl || !err) return;
+        const box = parentEl.createDiv("dsh-turn-error");
+        box.createDiv("dsh-turn-error-title").textContent = err.code ? `⚠️ 本回合失败 · ${err.code}` : "⚠️ 本回合失败";
+        box.createDiv("dsh-turn-error-body").textContent = err.message || "服务端未提供错误详情";
+        box.createDiv("dsh-turn-error-hint").textContent =
+            "消息已送达 DSH，但这一轮没有跑起来（模型/服务端错误）。同一会话在 DSH 网页版可见完整报错。";
+    }
+
+    /** 实时回合失败：立即 Notice + 把错误写进助手气泡（走 assistantMd，finalize 后仍可见），
+     *  随后 scheduleReconcile 会按历史真相用 renderTurnErrorBlock 重建。 */
+    surfaceTurnError(err) {
+        if (!err) return;
+        const code = err.code ? ` · ${err.code}` : "";
+        this.diagLastPrompt = `turn:err${code} ${String(err.message || "").slice(0, 160)}`;
+        try { this.updateDiag(); } catch (_e) { /* 诊断条非关键路径 */ }
+        try { new Notice(`DSH 回合失败${code}：${err.message}`, 12000); } catch (_e) { /* Notice 失败不影响渲染 */ }
+        if (!(this.assistantMd || "").includes("本回合失败")) {
+            const msg = String(err.message || "服务端未提供错误详情").replace(/\r?\n+/g, " ");
+            this.assistantMd = `${this.assistantMd || ""}\n\n> [!warning] 本回合失败${code}\n> ${msg}\n`;
+        }
     }
 
     /** 交错段渲染：text→围栏切分+Markdown；thinking→折叠块；tool→活动行。 */
@@ -5673,19 +5827,31 @@ class DshNativeView extends ItemView {
                 break;
             }
             case "assistant/message": {
-                // 兜底：DSH 有时把整段回复（含注入块）放在 assistant/message，而非走
-                // assistant/chunk 流式（VSCode fold.ts:129 同样做 strip 兜底）。剥系统上下文后渲染。
+                // 兜底：0.1.5 把整段回复放在 assistant/message（content 是部件数组，非流式），
+                // legacy 走 assistant/chunk 流式（VSCode fold.ts:129 同样做 strip 兜底）。
                 // 若本轮已收到 text-delta 流式内容，跳过避免重复（chunk 与 message 不会同时到）。
                 if (this._gotAssistantChunks) break;
                 const m = ev.data && (ev.data.message || ev.data.content || ev.data);
-                const raw = typeof m === "string" ? m : (m && m.content);
+                const parts = (m && typeof m === "object" && m.content !== undefined) ? m.content : m;
+                const got = foldAssistantParts(parts);
+                if (got.thinking && got.thinking.trim()) this.appendAssistant(got.thinking, true);
+                const raw = got.text;
                 if (typeof raw === "string" && raw) {
                     const cleaned = preprocessAssistantText(raw);
-                    if (cleaned && cleaned.trim()) this.appendAssistant(cleaned, false);
+                    if (cleaned && cleaned.trim()) {
+                        // 标记「WS 已给过正文」：轮询兜底据此判定不是空 turn，避免重复补齐。
+                        // 注意不能动 _gotAssistantChunks——那是「本轮走过 text-delta 流式」的语义，
+                        // 多步回合会有多条 assistant/message，置位会让后续正文被开头的 guard 丢掉。
+                        this._contentSetByWs = true;
+                        this.appendAssistant(cleaned, false);
+                    }
                 }
                 break;
             }
-            case "turn/end":
+            case "turn/end": {
+                // v0.7.1：失败回合先落可见报错（Notice + 气泡），再收尾——否则面板只剩空气泡/直接消失
+                const turnErr = foldTurnError(ev.data);
+                if (turnErr) this.surfaceTurnError(turnErr);
                 this.finalizeAssistant();
                 this._running = false;
                 this.stopElapsed();
@@ -5693,6 +5859,7 @@ class DshNativeView extends ItemView {
                 // 全量对账：400ms 后从权威 history 重建，消除增量渲染累积的所有错误
                 this.scheduleReconcile();
                 break;
+            }
             // ---- 持久事件（历史页/实时都可能到达；v2 折叠管线对齐）----
             case "chunkrow/text-chunks": {
                 // 历史页正文压缩形态：texts[] 拼接（不接必丢正文）
@@ -5987,38 +6154,48 @@ class DshNativeView extends ItemView {
                 const qTitleEl = card.createDiv("dsh-pending-title");
                 qTitleEl.textContent = "❓ DSH 提问";
                 const questions = entry.questions || [];
-                // 每个问题的答案收集：{ [index]: { selected: Set, custom: string } }
-                const answers = {};
+                // 每题草稿：{ selected: string[]（选中项 label）, custom: string } → 交给 questionAnswer 编码
+                const drafts = questions.map(() => ({ selected: [], custom: "" }));
                 questions.forEach((q, qi) => {
-                    const qObj = typeof q === "string" ? { question: q } : q;
-                    const label = qObj.label || qObj.question || qObj.text || JSON.stringify(q);
+                    const qObj = typeof q === "string" ? { question: q } : (q || {});
+                    const qText = qObj.question || qObj.label || qObj.text || JSON.stringify(q);
+                    // 服务端字段是 multiSelect；multi 是 legacy 客户端叫法
+                    const multi = qObj.multiSelect === true || qObj.multi === true;
                     const opts = Array.isArray(qObj.options) ? qObj.options : [];
-                    const multi = !!qObj.multi;
                     const qWrap = card.createDiv("dsh-question-item");
-                    const qLabel = qWrap.createDiv("dsh-question-label");
-                    qLabel.textContent = (qi + 1) + ". " + label;
-                    answers[qi] = { selected: new Set(), custom: "" };
+                    if (qObj.header) qWrap.createDiv("dsh-question-header").textContent = String(qObj.header);
+                    qWrap.createDiv("dsh-question-label").textContent = (qi + 1) + ". " + qText;
+                    if (qObj.detail) qWrap.createDiv("dsh-question-detail").textContent = String(qObj.detail);
                     if (opts.length) {
                         const optGroup = qWrap.createDiv("dsh-question-options");
-                        opts.forEach((opt, oi) => {
-                            const optLabel = typeof opt === "string" ? opt : (opt.label || opt.value || String(opt));
-                            const optVal = typeof opt === "string" ? opt : (opt.value || opt.label || String(opt));
+                        opts.forEach((opt) => {
+                            const o = typeof opt === "string" ? { label: opt } : (opt || {});
+                            const optLabel = o.label || o.value || String(opt);
                             const row = optGroup.createDiv("dsh-question-option");
                             const cb = row.createEl("input", {
-                                attr: { type: multi ? "checkbox" : "radio", name: "q" + qi, value: optVal }
+                                attr: { type: multi ? "checkbox" : "radio", name: "q" + qi, value: optLabel }
                             });
+                            // 回传的 selected 是**选中项 label**（AskUserQuestionAnswerItem.selected）
                             cb.addEventListener("change", () => {
+                                const sel = drafts[qi].selected;
+                                const at = sel.indexOf(optLabel);
                                 if (multi) {
-                                    if (cb.checked) answers[qi].selected.add(optVal);
-                                    else answers[qi].selected.delete(optVal);
+                                    if (cb.checked && at < 0) sel.push(optLabel);
+                                    else if (!cb.checked && at >= 0) sel.splice(at, 1);
                                 } else {
-                                    answers[qi].selected.clear();
-                                    if (cb.checked) answers[qi].selected.add(optVal);
+                                    sel.length = 0;
+                                    if (cb.checked) sel.push(optLabel);
                                 }
                             });
                             const span = row.createSpan("dsh-question-option-text");
                             span.textContent = optLabel;
                             span.addEventListener("click", () => { cb.click(); });
+                            if (o.description) {
+                                const desc = row.createDiv("dsh-question-option-desc");
+                                desc.textContent = String(o.description);
+                                desc.addEventListener("click", () => { cb.click(); });
+                                row.setAttribute("title", String(o.description));
+                            }
                         });
                     }
                     // 自定义回答输入
@@ -6026,19 +6203,14 @@ class DshNativeView extends ItemView {
                         cls: "dsh-native-input dsh-question-custom",
                         attr: { type: "text", placeholder: "或输入自定义回答…" }
                     });
-                    customInput.addEventListener("input", () => { answers[qi].custom = customInput.value; });
+                    customInput.addEventListener("input", () => { drafts[qi].custom = customInput.value; });
                 });
                 const actions = card.createDiv("dsh-pending-actions");
                 const ansBtn = actions.createEl("button", { cls: "dsh-btn mod-cta" });
                 ansBtn.textContent = "回答";
                 ansBtn.addEventListener("click", () => {
-                    // 组装答案：优先自定义回答，否则选选项
-                    const finalAnswers = questions.map((q, qi) => {
-                        const a = answers[qi];
-                        if (a.custom) return a.custom;
-                        return Array.from(a.selected).join(", ");
-                    });
-                    this.answerQuestion(key, finalAnswers);
+                    // 结构化应答 {answers:[{id, selected:[label…], custom?}]}——编码规则见 QUESTION-PURE
+                    this.answerQuestion(key, questionAnswer(questions, drafts));
                 });
             }
             this.scrollToBottom();
@@ -6061,15 +6233,16 @@ class DshNativeView extends ItemView {
         this.clearPending(key);
     }
 
-    async answerQuestion(key, answers) {
+    /** 提交用户提问的答案。answer 必须是 {answers:[{id, selected:string[], custom?}]}
+     *  （DSH 契约：selected 必须是数组、id 回显提问方给的 id。旧版拼成字符串会被服务端
+     *  `[...answer.selected]` 拒绝：Error: answer.selected is not iterable）。 */
+    async answerQuestion(key, answer) {
         const entry = this.pending.get(key);
         if (!entry) return;
-        // answers 可以是字符串（旧格式）或字符串数组（新格式，每个问题一个答案）
-        const ansArr = Array.isArray(answers) ? answers : (entry.questions || []).map(() => answers);
         try {
             await this.api.respond(entry.rpcId, {
                 sessionId: this.sessionId,
-                answer: { answers: ansArr },
+                answer,
             });
         } catch (e) {
             new Notice("回答失败：" + e.message);
