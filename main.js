@@ -18,11 +18,18 @@
  *   question/requested{questions:[{id,question,header?,detail?,options:[{label,description?}],multiSelect?}]}
  *                                                -> respond {sessionId, answer:{answers:[{id,selected:[label…],custom?}]}}
  *
- * 0.1.5 事件形状变更（v0.7.2 适配，实测抓包）：
+ * 0.1.5 事件形状变更（v0.7.2/.3 适配，实测抓包）：
  *   - 助手正文：assistant/message.data.message.content = [{type:"text"|"reasoning"|"tool-call",text}]（**数组**，
  *     旧版是整段字符串）；且该轮不再有 assistant/chunk 流式帧。
+ *   - 一个回合可有多个 step，每步一条 assistant/message → 逐块收，并按 turn:step 与流式 delta 去重。
  *   - 事件次序：turn/start → user/message(kind=user) → 注入帧 → assistant/message → turn/end。
  *     即人类消息落在 turn/start **之后**——不能再用 user 项当回合边界（会把正文丢掉、turn/end 漏标）。
+ *
+ * v0.7.3 对齐 VSCode 0.1.5 后的三处调整（MODEL-PURE / STATS-PURE 为新增纯函数块）：
+ *   - 模型说真话：会话模型只认宿主 modelSelection 投影（next ?? lastUsed）/ selectModel 回执；
+ *     session/modelCatalog 的 default 是全局默认，只能当未知时的兜底显示，且永不写进工作区记忆。
+ *   - 底栏 token：输入=cacheRead+uncached、缓存命中%=cacheRead/总输入、K/M 缩写、零值不显示。
+ *   - 多步回合正文：见上。
  */
 
 const {
@@ -1234,8 +1241,11 @@ class DshApi {
             return { items: res.items || [] };
         }
         if (method === "session.models") {
+            // 注意：v012 只有 session/modelCatalog（**不接受 sessionId**），返回的 default 是
+            // 宿主全局默认模型 → 这里只能当「未知时会话模型」的兜底显示值，
+            // 绝不能写进工作区记忆、也不能当成某个会话的模型（v0.7.3 修正）。
             const cat = await this.v012Request("session/modelCatalog", {});
-            return { current: cat && cat.default, groups: cat && cat.groups, failures: cat && cat.failures };
+            return { current: cat && cat.default, groups: cat && cat.groups, failures: cat && cat.failures, catalogDefaultOnly: true };
         }
         if (method === "session.list") {
             const value = await this.v012Request("session/list", { _request: {} });
@@ -2250,6 +2260,11 @@ class DshFold {
         this._firstSeq = -1;
         this._turnCounter = 0;
         this._running = false;
+        // v0.7.3（对齐 VSCode v0.18.2）：按 "turn:step" 记住哪些步骤的正文/思考已经以
+        // 流式 delta 到过——完成消息 assistant/message 与 delta 是同一段文本的两种表示，
+        // 按 step 去重才能既不去重掉「多步回合里后续步骤的正文」、也不重复渲染。
+        this._streamedText = new Set();
+        this._streamedThinking = new Set();
     }
     get seq() { return this._lastSeq; }
     get oldestSeq() { return this._firstSeq; }
@@ -2307,7 +2322,14 @@ class DshFold {
                 break;
             }
             case "assistant/chunk": {
-                this._applyChunk(ev.data && ev.data.chunk, view);
+                const d = ev.data || {};
+                const chunk = d.chunk;
+                // 记住「本 step 的正文/思考已由流式 delta 到过」：紧随其后的完成消息
+                // assistant/message 携带同一段文本（历史回放则只有它），按 step 去重即可。
+                const stepKey = `${d.turn == null ? "?" : d.turn}:${d.step == null ? "?" : d.step}`;
+                if (chunk && chunk.type === "text-delta") this._streamedText.add(stepKey);
+                else if (chunk && chunk.type === "reasoning-delta") this._streamedThinking.add(stepKey);
+                this._applyChunk(chunk, view);
                 break;
             }
             // 历史回放（session/page）把 text/reasoning 压成 chunkrow 行；text-delta 不持久化。
@@ -2323,21 +2345,35 @@ class DshFold {
             }
             case "assistant/message": {
                 // 用 _ensureTurn：0.1.5 的 user/message 插在 turn/start 之后，按 user 找回合会找不到
-                const cur = this._ensureTurn();
+                this._ensureTurn();
                 // 0.1.5 形状：data.message.content = [{type:"text"|"reasoning"|"tool-call",…}]（数组！）
-                // legacy 形状：纯字符串 / {content:"…"}。只认字符串会让整条回复消失（面板空白气泡）。
-                const m = (ev.data && (ev.data.message || ev.data.content)) || ev.data;
-                const parts = (m && typeof m === "object" && m.content !== undefined) ? m.content : m;
-                const got = foldAssistantParts(parts);
-                const text = stripSystemContext(got.text || "");
-                if (text && !cur.text) {
-                    cur.text = text;
-                    // 必须进 segments：渲染层有 segments 时只按段渲染，只写 text 会「有正文但不显示」
-                    if (!cur.segments.some((s) => s.kind === "text")) cur.segments.push({ kind: "text", text });
+                // legacy 形状：纯字符串 / {content:"…"}。**逐块处理**：一个回合可以有多个 step，
+                // 每个 step 各有一条完成消息——只认第一条会丢掉后续步骤的正文（v0.7.2 的缺口）。
+                const d = ev.data || {};
+                const msg = d.message || d;
+                const content = msg && typeof msg === "object" ? msg.content : undefined;
+                const stepKey = `${d.turn == null ? "?" : d.turn}:${d.step == null ? "?" : d.step}`;
+                const appendBlock = (kind, t) => {
+                    const streamed = kind === "text" ? this._streamedText : this._streamedThinking;
+                    if (streamed.has(stepKey)) return; // 该 step 的 delta 已经渲染过同一段文本
+                    if (kind === "text") this._appendSeg("text", t);
+                    else this._appendSeg("thinking", t);
+                };
+                if (!Array.isArray(content)) {
+                    const mt = typeof msg === "string" ? msg : content;
+                    if (typeof mt === "string" && mt) {
+                        const cleaned = stripSystemContext(mt);
+                        if (cleaned) appendBlock("text", cleaned);
+                    }
+                    break;
                 }
-                if (got.thinking && !cur.thinking) {
-                    cur.thinking = got.thinking;
-                    if (!cur.segments.some((s) => s.kind === "thinking")) cur.segments.push({ kind: "thinking", text: got.thinking });
+                for (const b of content) {
+                    if (!b || typeof b !== "object") continue;
+                    const t = typeof b.text === "string" ? b.text : "";
+                    if (!t) continue;
+                    if (b.type === "text") { const cleaned = stripSystemContext(t); if (cleaned) appendBlock("text", cleaned); }
+                    else if (b.type === "reasoning" || b.type === "thinking") appendBlock("thinking", t);
+                    // tool-call 部件跳过：宿主紧跟一条独立 tool/call 事件负责活动卡
                 }
                 break;
             }
@@ -2397,6 +2433,7 @@ class DshFold {
     }
     reset() {
         this.items = []; this._lastSeq = -1; this._firstSeq = -1; this._turnCounter = 0; this._running = false;
+        this._streamedText.clear(); this._streamedThinking.clear();
     }
     _applyChunk(chunk, view) {
         if (!chunk || typeof chunk.type !== "string") return;
@@ -2650,26 +2687,32 @@ function foldLatestTurn(events) {
     let thinking = "";
     let ended = false;
     let error = null;
+    // 按 step 去重：完成消息与流式 delta 是同一段文本的两种表示（与 DshFold 同规则）
+    const streamedText = new Set();
+    const streamedThinking = new Set();
     for (let i = startIdx; i < events.length; i++) {
         const ev = (events[i] && events[i].event) || {};
+        const d = ev.data || {};
+        const stepKey = `${d.turn == null ? "?" : d.turn}:${d.step == null ? "?" : d.step}`;
         if (ev.type === "turn/end") { ended = true; error = foldTurnError(ev.data) || error; }
         else if (ev.type === "assistant/chunk") {
-            const ch = ev.data && ev.data.chunk;
+            const ch = d.chunk;
             if (!ch) continue;
-            if (ch.type === "text-delta" && typeof ch.text === "string") text += ch.text;
-            else if (ch.type === "reasoning-delta" && typeof ch.text === "string") thinking += ch.text;
+            if (ch.type === "text-delta" && typeof ch.text === "string") { streamedText.add(stepKey); text += ch.text; }
+            else if (ch.type === "reasoning-delta" && typeof ch.text === "string") { streamedThinking.add(stepKey); thinking += ch.text; }
         } else if (ev.type === "chunkrow/text-chunks") {
-            const texts = ev.data && ev.data.texts;
+            const texts = d.texts;
             if (Array.isArray(texts)) text += texts.join("");
         } else if (ev.type === "chunkrow/reasoning-chunks") {
-            const texts = ev.data && ev.data.texts;
+            const texts = d.texts;
             if (Array.isArray(texts)) thinking += texts.join("");
         } else if (ev.type === "assistant/message") {
-            const m = ev.data && (ev.data.message || ev.data.content || ev.data);
+            const m = d.message || d.content || d;
             const parts = (m && typeof m === "object" && m.content !== undefined) ? m.content : m;
             const got = foldAssistantParts(parts);
-            if (!text && got.text) text = got.text;
-            if (!thinking && got.thinking) thinking = got.thinking;
+            // 多步回合的每一步都要收（旧实现用 `!text` 守卫 → 只剩第一步的正文）
+            if (got.text && !streamedText.has(stepKey)) text += got.text;
+            if (got.thinking && !streamedThinking.has(stepKey)) thinking += got.thinking;
         }
     }
     return { text, thinking, ended, error };
@@ -2757,6 +2800,86 @@ function questionAnswer(questions, drafts) {
 }
 /* ==== QUESTION-PURE-END ==== */
 
+/* ==== MODEL-PURE-BEGIN — 会话真实模型解析（回归：node scripts/model-regress.mjs） ====
+ * 为什么要有这块（对齐 VSCode v0.18.3，实测同一坑）：
+ *   `session/modelCatalog`（无 sessionId 参数）返回的 `default` 是**宿主全局默认模型**——
+ *   那是「新会话从哪个模型起步」，全项目共享，**不是某个已存在会话的模型**。
+ *   旧实现把它当会话模型显示（芯片/下拉会说谎：会话实际跑 deepseek-official，
+ *   面板却显示 comleader），并把它写进「本项目最近使用模型」→ 跨项目串味。
+ *   会话自己的模型在宿主 `modelSelection` 投影里：`{lastUsed, next}`。
+ *     · lastUsed = 最近一次真实请求走的路由
+ *     · next     = 待生效的切换（selectModel 后立刻反映），无则回落 lastUsed
+ *   selectModel 的回执 `{selected:{provider,model,reasoningEffort?}}` 是宿主**归一化**后的值，
+ *   显示与记忆都要用它，避免显示与实际请求漂移。
+ */
+function modelChoiceOf(value) {
+    if (!value || typeof value !== "object") return undefined;
+    const provider = typeof value.provider === "string" ? value.provider : "";
+    const model = typeof value.model === "string" ? value.model : "";
+    if (!provider || !model) return undefined;
+    const effort = typeof value.reasoningEffort === "string" && value.reasoningEffort ? value.reasoningEffort : "";
+    return effort ? { provider, model, reasoningEffort: effort } : { provider, model };
+}
+
+/** 会话真实模型：modelSelection.next 优先（待生效切换立刻可见），无则 lastUsed。
+ *  传 catalog 形状（{default:…}/{groups:…}）必须返回 undefined——它永远不能冒充会话模型。 */
+function realModelOf(modelSelection) {
+    if (!modelSelection || typeof modelSelection !== "object") return undefined;
+    if (!("next" in modelSelection) && !("lastUsed" in modelSelection)) return undefined;
+    return modelChoiceOf(modelSelection.next) || modelChoiceOf(modelSelection.lastUsed);
+}
+
+/** 从 projections 载荷里取 modelSelection：兼容 {values:{modelSelection}} 与 {modelSelection}
+ *  （历史快照给前者，投影帧给后者）。 */
+function modelSelectionOf(projections) {
+    if (!projections || typeof projections !== "object") return undefined;
+    if (projections.values && typeof projections.values === "object") return projections.values.modelSelection;
+    return projections.modelSelection;
+}
+
+/** selectModel 回执归一化：宿主给了 selected 就用它，否则退回请求值。 */
+function modelEchoOf(result, fallback) {
+    const sel = result && typeof result === "object" ? result.selected : undefined;
+    return modelChoiceOf(sel) || modelChoiceOf(fallback);
+}
+
+/** 该会话是否可以把模型记进「本项目最近使用」：真实会话、非空白、非子代理、本工作区。
+ *  子代理会话与用户会话共享 cwd，但可能跑别的模型——不能当项目默认。 */
+function modelMemoryWorthy(row, sameWorkspace) {
+    if (!row || typeof row !== "object") return false;
+    if (row.blank) return false;
+    if (row.origin === "subagent") return false;
+    return !!sameWorkspace;
+}
+/* ==== MODEL-PURE-END ==== */
+
+/* ==== STATS-PURE-BEGIN — 底栏 token 口径（回归：node scripts/stats-regress.mjs） ====
+ * 与 dsh 本体 GUI / VSCode v0.18.1 对齐（实测校准）：
+ *   tokenUsage = {uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}
+ *   输入 = 总输入 = cacheRead + uncached（旧实现只显示 uncached，量级差 ~8 倍）
+ *   缓存命中% = cacheRead / 总输入
+ *   计数用 K/M 缩写；零值不显示（新会话不出现「缓存命中 NaN%」）
+ */
+function fmtTokenCount(n) {
+    const v = Number(n) || 0;
+    if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+    if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+    return `${v}`;
+}
+function tokenLineOf(tokenUsage) {
+    const v = tokenUsage && typeof tokenUsage === "object" ? tokenUsage : {};
+    const cacheRead = Number(v.cacheReadTokens) || 0;
+    const uncached = Number(v.uncachedInputTokens) || 0;
+    const inputTotal = cacheRead + uncached;
+    const output = Number(v.outputTokens) || 0;
+    const parts = [];
+    if (inputTotal > 0) parts.push(`缓存命中 ${Math.round((100 * cacheRead) / inputTotal)}%`);
+    if (inputTotal > 0) parts.push(`输入 ${fmtTokenCount(inputTotal)} tok`);
+    if (output > 0) parts.push(`输出 ${fmtTokenCount(output)} tok`);
+    return parts.join("  ·  ");
+}
+/* ==== STATS-PURE-END ==== */
+
 // 入口：先剥系统块，再走 v0.5.0 同款结构化切分——fence 段重排成规范 dsh-ui 代码块；
 // 纯文本段保留 wrapDshUiJson 兜底（无栏裸 JSON 自动包栏，Obsidian 原有能力不回退）
 function preprocessAssistantText(text) {
@@ -2814,6 +2937,12 @@ class DshNativeView extends ItemView {
         this._contentSetByWs = false;
         this._pollStart = 0;
         this._modelFixPromise = null;
+        // v0.7.3：按 step 记「已用 delta 渲染过的正文/思考」（对齐 VSCode v0.18.2 的 streamedText/Thinking）
+        this._streamedText = new Set();
+        this._streamedThinking = new Set();
+        // v0.7.3：sessionId → 会话真实模型 {provider, model, reasoningEffort?}
+        // （来自 modelSelection 投影 / selectModel 回执；catalog 的 default 永不入此表）
+        this._sessionModels = new Map();
         // Phase 6：附件（@ 文件补全 / 图片粘贴）
         this._attachments = [];      // [{kind:"file", file:TFile} | {kind:"image", part:{type,image,...}}]
         this._vaultMdFiles = null;   // 懒缓存：vault 内 markdown 文件列表
@@ -3954,7 +4083,9 @@ class DshNativeView extends ItemView {
             const wsId = this.workspace && this.workspace.workspaceId;
             const mem = wsId && this.plugin.settings.modelMemory ? this.plugin.settings.modelMemory[wsId] : null;
             if (!mem || !mem.provider || !mem.model) { return; }
-            await this.api.selectModel(sessionId, mem.provider, mem.model);
+            const res = await this.api.selectModel(sessionId, mem.provider, mem.model);
+            // 回执是宿主归一化后的值 → 会话真实模型表与下拉都跟它
+            this._setSessionModel(sessionId, modelEchoOf(res, mem) || mem);
             this.loadModels(); // 让当前下拉反映应用后的值
         } catch (_e) {
             const wsId = this.workspace && this.workspace.workspaceId;
@@ -4039,7 +4170,11 @@ class DshNativeView extends ItemView {
             const r = await this.api.getModels(this.sessionId);
             this._currentModels = r;
             const groups = Array.isArray(r && r.groups) ? r.groups : [];
-            const current = r && r.current;
+            // v0.7.3（对齐 VSCode v0.18.3）：`r.current` 是**宿主全局默认模型**（新会话起步模型，
+            // 全项目共享）——只有「还不知道这个会话自己的模型」时才允许临时当显示值；
+            // 知道就必须用会话真实模型，否则下拉会显示别的模型（用户以为切换没生效）。
+            const sessionChoice = this.sessionModelChoice(this.sessionId);
+            const current = sessionChoice || (r && r.current);
 
             this.modelSelect.empty();
             let flatCount = 0;
@@ -4111,14 +4246,17 @@ class DshNativeView extends ItemView {
             }
             // 思考强度下拉跟随当前模型（对齐 VSCode EffortPicker）
             this.renderEfforts(current, groups);
-            // v0.5.2 对齐：本项目真实会话（非空白）的当前模型也作为工作区记忆来源
+            // v0.7.3：工作区记忆只记**会话真实模型**（sessionChoice），且排除空白/子代理/非本工作区。
+            // 旧实现记的是 catalog default（宿主全局）→ 别的项目的模型会被写进本项目。
+            // 会话列表本身就按工作区过滤且已排除 subagent/blank（见 listSessions），
+            // 所以「行存在」即代表本工作区真实会话。
             const wsId = this.workspace && this.workspace.workspaceId;
-            if (wsId && current && current.provider && current.model && this.plugin.settings.modelMemory) {
+            if (wsId && sessionChoice && this.plugin.settings.modelMemory) {
                 const sRow = this.sessions.find((x) => x.sessionId === this.sessionId);
-                if (sRow && !sRow.blank) {
+                if (modelMemoryWorthy(sRow, !!sRow)) {
                     const mem = this.plugin.settings.modelMemory[wsId];
-                    if (!mem || mem.provider !== current.provider || mem.model !== current.model) {
-                        this.plugin.settings.modelMemory[wsId] = { provider: current.provider, model: current.model };
+                    if (!mem || mem.provider !== sessionChoice.provider || mem.model !== sessionChoice.model) {
+                        this.plugin.settings.modelMemory[wsId] = { provider: sessionChoice.provider, model: sessionChoice.model };
                         try { await this.plugin.saveSettings(); } catch (_e) {}
                     }
                 }
@@ -4159,14 +4297,18 @@ class DshNativeView extends ItemView {
         this.effortSelect.style.display = "";
     }
     async switchModel(provider, model, effort) {
-        if (!this.sessionId) return;
+        // v0.7.3（对齐 VSCode v0.18.3）：没有会话时静默 return 会让用户以为「切换没生效」
+        if (!this.sessionId) { new Notice("请先选择或新建一个会话，再切换模型"); return; }
         try {
             const rpcResult = await this.api.selectModel(this.sessionId, provider, model, effort);
-            new Notice("已切换模型：" + provider + "/" + model);
+            // 宿主会归一化选择（如大小写/别名），显示与记忆都用**回执值**，避免显示与实际请求漂移
+            const applied = modelEchoOf(rpcResult, { provider, model, ...(effort ? { reasoningEffort: effort } : {}) }) || { provider, model };
+            this._setSessionModel(this.sessionId, applied);
+            new Notice("已切换模型：" + applied.provider + "/" + applied.model);
             // v0.5.2 对齐：手动切模型 → 记入本工作区记忆（新会话只继承本项目的，不吃宿主全局最近值）
             const wsId = this.workspace && this.workspace.workspaceId;
             if (wsId && this.plugin.settings.modelMemory) {
-                this.plugin.settings.modelMemory[wsId] = { provider, model };
+                this.plugin.settings.modelMemory[wsId] = { provider: applied.provider, model: applied.model };
                 try { await this.plugin.saveSettings(); } catch (_e) {}
             }
             // 重拉目录：不同模型的 reasoning.efforts 不同，思考强度下拉要跟随
@@ -4700,6 +4842,8 @@ class DshNativeView extends ItemView {
         this._turnDone = false;
         this._contentSetByWs = false;
         this._gotAssistantChunks = false;
+        this._streamedText = new Set();
+        this._streamedThinking = new Set();
         this._pollStart = Date.now();
         // 用户主动发消息 → 退出 WS catchup，后续 assistant 事件正常处理
         this._wsCatchup = false;
@@ -5210,6 +5354,8 @@ class DshNativeView extends ItemView {
         this._activityHolder = null;
         this._gotAssistantChunks = false;
         this._contentSetByWs = false;
+        this._streamedText = new Set();
+        this._streamedThinking = new Set();
         this._userTextsSent = new Set();
         // 从权威源重建
         try {
@@ -5315,6 +5461,10 @@ class DshNativeView extends ItemView {
         try {
             const h = await this.api.getHistory(id, beforeSeq, 24);
             const events = (h && h.events) || (h && h.result && h.result.value && h.result.value.events) || [];
+            // v0.7.3：历史快照自带 projections（此前被丢弃）——种下会话真实模型，
+            // 后续 loadModels 才会显示这个会话真正在跑的模型，而不是宿主全局默认。
+            const msReal = realModelOf(modelSelectionOf(h && h.projections));
+            if (msReal && this._setSessionModel(id, msReal) && this.sessionId === id) void this.loadModels();
             // 记录翻页边界（events 按时间正序，[0] 是最旧一条的 seq）
             if (events.length) {
                 const firstSeq = events[0].event && events[0].event.seq;
@@ -5761,6 +5911,30 @@ class DshNativeView extends ItemView {
         }
     }
 
+    /** v0.7.3：事件 → "turn:step" 键。完成消息 assistant/message 与流式 delta 用同一键去重
+     *  （一个回合可以有多个 step，每步各一条完成消息，整轮布尔会把后续步骤的正文丢掉）。 */
+    _stepKeyOf(data) {
+        const d = data || {};
+        return `${d.turn == null ? "?" : d.turn}:${d.step == null ? "?" : d.step}`;
+    }
+
+    /** v0.7.3：记下某会话的真实模型（来自 modelSelection 投影 / selectModel 回执）。
+     *  会话级 Map：切会话不用清、也不会被别的会话的推送覆盖。返回是否有变化。 */
+    _setSessionModel(sessionId, choice) {
+        const c = modelChoiceOf(choice);
+        if (!sessionId || !c) return false;
+        const prev = this._sessionModels.get(sessionId);
+        if (prev && prev.provider === c.provider && prev.model === c.model
+            && (prev.reasoningEffort || "") === (c.reasoningEffort || "")) return false;
+        this._sessionModels.set(sessionId, c);
+        return true;
+    }
+
+    /** 当前会话的真实模型（未知返回 undefined——调用方必须回落而不是拿 catalog default 冒充）。 */
+    sessionModelChoice(sessionId) {
+        return this._sessionModels.get(sessionId || this.sessionId);
+    }
+
     handleSessionEvent(ev) {
         if (!ev) return;
         // 精确过滤 WS 重放：历史已从 REST 渲染后，记录了最后一条事件的 seq。
@@ -5788,6 +5962,9 @@ class DshNativeView extends ItemView {
             }
             case "turn/start":
                 this._gotAssistantChunks = false;
+                // v0.7.3：按 step 记「本 step 正文/思考已由 delta 到过」（多步回合不能只用一个整轮布尔）
+                this._streamedText = new Set();
+                this._streamedThinking = new Set();
                 this.beginAssistantBubble();
                 this._running = true;
                 this.startElapsed();
@@ -5806,7 +5983,9 @@ class DshNativeView extends ItemView {
                 if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
                     if (typeof chunk.text !== "string" || chunk.text.length === 0) break;
                     this._contentSetByWs = true;
-                    if (chunk.type === "text-delta") this._gotAssistantChunks = true;
+                    const stepKey = this._stepKeyOf(ev.data);
+                    if (chunk.type === "text-delta") { this._gotAssistantChunks = true; this._streamedText.add(stepKey); }
+                    else this._streamedThinking.add(stepKey);
                     this.appendAssistant(chunk.text, chunk.type === "reasoning-delta");
                     break;
                 }
@@ -5827,21 +6006,26 @@ class DshNativeView extends ItemView {
                 break;
             }
             case "assistant/message": {
-                // 兜底：0.1.5 把整段回复放在 assistant/message（content 是部件数组，非流式），
-                // legacy 走 assistant/chunk 流式（VSCode fold.ts:129 同样做 strip 兜底）。
-                // 若本轮已收到 text-delta 流式内容，跳过避免重复（chunk 与 message 不会同时到）。
-                if (this._gotAssistantChunks) break;
-                const m = ev.data && (ev.data.message || ev.data.content || ev.data);
+                // 0.1.5 把整段回复放在 assistant/message（content 是部件数组，非流式）；
+                // legacy 走 assistant/chunk 流式（VSCode fold.ts 同样做 strip 兜底）。
+                // **按 step 去重**：一个回合可有多个 step，每步一条完成消息；本 step 已经用
+                // delta 流过就跳过，没流过就补渲染——整轮布尔会把后续步骤的正文整条丢掉。
+                const stepKey = this._stepKeyOf(ev.data);
+                const d = ev.data || {};
+                const m = d.message || d.content || d;
                 const parts = (m && typeof m === "object" && m.content !== undefined) ? m.content : m;
                 const got = foldAssistantParts(parts);
-                if (got.thinking && got.thinking.trim()) this.appendAssistant(got.thinking, true);
+                if (got.thinking && got.thinking.trim() && !this._streamedThinking.has(stepKey)) {
+                    this._streamedThinking.add(stepKey);
+                    this.appendAssistant(got.thinking, true);
+                }
                 const raw = got.text;
-                if (typeof raw === "string" && raw) {
+                if (typeof raw === "string" && raw && !this._streamedText.has(stepKey)) {
                     const cleaned = preprocessAssistantText(raw);
                     if (cleaned && cleaned.trim()) {
+                        this._streamedText.add(stepKey);
                         // 标记「WS 已给过正文」：轮询兜底据此判定不是空 turn，避免重复补齐。
-                        // 注意不能动 _gotAssistantChunks——那是「本轮走过 text-delta 流式」的语义，
-                        // 多步回合会有多条 assistant/message，置位会让后续正文被开头的 guard 丢掉。
+                        // 不能动 _gotAssistantChunks——那是「本轮走过 text-delta 流式」的语义。
                         this._contentSetByWs = true;
                         this.appendAssistant(cleaned, false);
                     }
@@ -5914,13 +6098,17 @@ class DshNativeView extends ItemView {
     }
 
     handleProjection(p) {
+        if (p.key === "modelSelection") {
+            // v0.7.3（对齐 VSCode v0.18.3）：会话自己的模型 = modelSelection.next ?? lastUsed。
+            // 这是唯一可信来源；catalog 的 default 是宿主全局默认（新会话起步模型），
+            // 拿它当「会话模型」显示会说谎、并把它写进项目记忆会跨项目串味。
+            const real = realModelOf(p.value);
+            if (real && this._setSessionModel(this.sessionId, real)) void this.loadModels();
+            return;
+        }
         if (p.key === "tokenUsage" || p.key === "liveTokenUsage") {
-            const v = p.value || {};
-            const parts = [];
-            if (v.outputTokens != null) parts.push(`out ${v.outputTokens}`);
-            if (v.uncachedInputTokens != null) parts.push(`in ${v.uncachedInputTokens}`);
-            if (v.cacheReadTokens != null) parts.push(`cache ${v.cacheReadTokens}`);
-            this.diagTokens = parts.join("  ·  ");
+            // v0.7.3（对齐 VSCode v0.18.1）：输入=总输入（cacheRead+uncached）、命中率、K/M 缩写
+            this.diagTokens = tokenLineOf(p.value || {});
             this.updateDiag();
             this.updateComposerMeta();
         } else if (p.key === "title" && this.sessionId) {

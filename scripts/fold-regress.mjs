@@ -319,5 +319,55 @@ const check = (name, ok, detail = "") => {
         turns.map((t) => `${t.text}/${t.ended}`).join(" | "));
 }
 
+// 17. v0.7.3（对齐 VSCode v0.18.2）：多步回合——每个 step 各有一条完成消息，正文必须全都收
+{
+    const f = new DshFold();
+    f.pushMany([
+        { event: { type: "turn/start", seq: 1, data: { turn: 1 } } },
+        { event: { type: "step/start", seq: 2, data: { turn: 1, step: 1, title: "看文件" } } },
+        { event: { type: "assistant/message", seq: 3, data: { turn: 1, step: 1, message: { role: "assistant", content: [
+            { type: "text", text: "我先看文件。" },
+            { type: "tool-call", id: "c1", name: "read", arguments: '{"path":"a.md"}' },
+        ] } } } },
+        { event: { type: "tool/call", seq: 4, data: { turn: 1, step: 1, callId: "c1", name: "read", arguments: '{"path":"a.md"}' } } },
+        { event: { type: "step/end", seq: 5, data: { turn: 1, step: 1 } } },
+        { event: { type: "step/start", seq: 6, data: { turn: 1, step: 2, title: "总结" } } },
+        { event: { type: "assistant/message", seq: 7, data: { turn: 1, step: 2, message: { role: "assistant", content: [
+            { type: "text", text: "结论：这样做。" },
+        ] } } } },
+        { event: { type: "turn/end", seq: 8, data: { turn: 1, reason: { kind: "completed" } } } },
+    ]);
+    const turn = f.items.filter((i) => i.kind === "turn").pop();
+    check("多步回合：两步正文都在", !!turn && turn.text === "我先看文件。结论：这样做。", JSON.stringify(turn && turn.text));
+    check("多步回合：正文按步进 segments", !!turn && turn.segments.filter((s) => s.kind === "text").map((s) => s.text).join("|") === "我先看文件。|结论：这样做。",
+        turn ? turn.segments.map((s) => s.kind).join(",") : "?");
+}
+
+// 18. 按 step 去重：delta 流过的 step 不重复收完成消息，没流过的 step 必须收
+{
+    const f = new DshFold();
+    f.pushMany([
+        { event: { type: "turn/start", seq: 1, data: { turn: 1 } } },
+        { event: { type: "assistant/chunk", seq: 2, data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "流式一" } } } },
+        { event: { type: "assistant/message", seq: 3, data: { turn: 1, step: 1, message: { role: "assistant", content: [{ type: "text", text: "流式一" }] } } } },
+        { event: { type: "assistant/message", seq: 4, data: { turn: 1, step: 2, message: { role: "assistant", content: [{ type: "text", text: "补收二" }] } } } },
+        { event: { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } } },
+    ]);
+    const turn = f.items.filter((i) => i.kind === "turn").pop();
+    check("按 step 去重：delta 步不重复", !!turn && turn.text === "流式一补收二", JSON.stringify(turn && turn.text));
+}
+
+// 19. foldLatestTurn（轮询兜底）同样要收多步正文
+{
+    const t = ns.foldLatestTurn([
+        { event: { type: "turn/start", seq: 1, data: { turn: 1 } } },
+        { event: { type: "assistant/chunk", seq: 2, data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "流一" } } } },
+        { event: { type: "assistant/message", seq: 3, data: { turn: 1, step: 1, message: { role: "assistant", content: [{ type: "text", text: "流一" }] } } } },
+        { event: { type: "assistant/message", seq: 4, data: { turn: 1, step: 2, message: { role: "assistant", content: [{ type: "text", text: "步二" }] } } } },
+        { event: { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } } },
+    ]);
+    check("foldLatestTurn 多步 + 去重", !!t && t.text === "流一歩二".replace("歩", "步") && t.ended === true, JSON.stringify(t && t.text));
+}
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);
