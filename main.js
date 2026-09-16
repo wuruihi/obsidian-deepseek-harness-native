@@ -1485,12 +1485,18 @@ class DshApi {
         // DSH 0.1.2+ 的 session/create 只认 workspaceId 或 cwd 之一（同时给报 gateway/bad-request）。
         // ★ 只有 workspaceId 会把会话 attach 进工作区（见 v012Call 同名注释）；cwd 建的会话在 DSH 本体
         //   是「未分组」。所以对象里有 workspaceId 就优先它，只有退化场景（拿不到工作区对象）才退回 cwd。
-        let payload = {};
+        let payload = null;
         if (workspace && typeof workspace === "object") {
-            payload = workspace.workspaceId ? { workspaceId: workspace.workspaceId } : { cwd: workspace.path };
+            payload = workspace.workspaceId
+                ? { workspaceId: workspace.workspaceId }
+                : (workspace.path ? { cwd: workspace.path } : null);
         } else if (typeof workspace === "string" && workspace) {
             payload = { workspaceId: workspace };
         }
+        // 拿不到任何去处时必须大声失败：session/create 在 workspaceId/cwd 都缺时，服务器会用
+        // **自己进程的 cwd** 建会话（静默落到无关目录、且在 DSH 本体显示「未分组」）——比报错更糟。
+        // 可达路径：DSH 服务重启后面板把 this.workspace 置空，此时点「新建会话」。
+        if (!payload) throw new Error("无法新建会话：工作区尚未就绪（workspaceId/path 都没有），请重连 DSH 后重试");
         return this.call("session.create", payload);
     }
     async prompt(sessionId, textOrParts, mode = "queue") {
