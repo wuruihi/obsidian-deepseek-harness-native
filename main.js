@@ -25,6 +25,11 @@
  *   - 事件次序：turn/start → user/message(kind=user) → 注入帧 → assistant/message → turn/end。
  *     即人类消息落在 turn/start **之后**——不能再用 user 项当回合边界（会把正文丢掉、turn/end 漏标）。
  *
+ * v0.7.4 会话分组修正（真机实测，tmp-plugin-debug/wsgroup.mjs）：
+ *   - DSH 的 session/create 只认 workspaceId 或 cwd 之一，**只有 workspaceId 会把会话 attach 进工作区**；
+ *     只给 cwd 时服务器照建会话但不登记分组 → DSH 本体显示「未分组」（VSCode 插件一直传 workspaceId，故正常）。
+ *   - workspace/create 回执是 {workspace:{...}}，ensureWorkspace 必须解包，否则拿不到 workspaceId/path。
+ *
  * v0.7.3 对齐 VSCode 0.1.5 后的三处调整（MODEL-PURE / STATS-PURE 为新增纯函数块）：
  *   - 模型说真话：会话模型只认宿主 modelSelection 投影（next ?? lastUsed）/ selectModel 回执；
  *     session/modelCatalog 的 default 是全局默认，只能当未知时的兜底显示，且永不写进工作区记忆。
@@ -1279,8 +1284,14 @@ class DshApi {
             });
         }
         if (method === "session.create") {
-            // 0.1.2 精确参数：request 只收 cwd
-            return this.v012Request("session/create", { request: { cwd: payload && (payload.cwd || payload.workspaceId) } });
+            // 0.1.2+ 精确参数：request 收 workspaceId **或** cwd，二者互斥（同时给 → gateway/bad-request）。
+            // ★ 真机实测（tmp-plugin-debug/wsgroup.mjs）：只有 workspaceId 会把会话 attach 进工作区；
+            //   只给 cwd 时服务器照建会话但不登记分组 → DSH 本体把它显示成「未分组」。
+            const p = payload || {};
+            const request = p.workspaceId !== undefined
+                ? { workspaceId: p.workspaceId }
+                : (p.cwd !== undefined ? { cwd: p.cwd } : {});
+            return this.v012Request("session/create", { request });
         }
         // request 包装表（字段名一致，仅套 {request}）
         const WRAPPED = new Set([
@@ -1408,7 +1419,12 @@ class DshApi {
     async ensureWorkspace(vaultPath) {
         const wl = await this.call("workspace.list");
         let ws = wl.items.find((i) => normPath(i.path) === normPath(vaultPath));
-        if (!ws) ws = await this.call("workspace.create", { path: vaultPath });
+        if (!ws) {
+            // v012 的 workspace/create 回执是 {workspace:{...}, created:bool}——必须取 .workspace，
+            // 否则 this.workspace 上没有 workspaceId/path（会话列表、分组、建会话会一起错）。
+            const res = await this.call("workspace.create", { path: vaultPath });
+            ws = res && res.workspace ? res.workspace : res;
+        }
         return ws;
     }
     // v0.5.0 工作区管理（对齐 VSCode manager.workspace*：rename/insertBefore/delete/create/insertSessionBefore）
@@ -1466,10 +1482,15 @@ class DshApi {
             .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     }
     async createSession(workspace) {
-        // 接收工作区对象或裸 id：v012 的 session/create 精确收 cwd（对象里有 path）
-        const payload = (workspace && typeof workspace === "object")
-            ? { workspaceId: workspace.workspaceId, cwd: workspace.path }
-            : { workspaceId: workspace };
+        // DSH 0.1.2+ 的 session/create 只认 workspaceId 或 cwd 之一（同时给报 gateway/bad-request）。
+        // ★ 只有 workspaceId 会把会话 attach 进工作区（见 v012Call 同名注释）；cwd 建的会话在 DSH 本体
+        //   是「未分组」。所以对象里有 workspaceId 就优先它，只有退化场景（拿不到工作区对象）才退回 cwd。
+        let payload = {};
+        if (workspace && typeof workspace === "object") {
+            payload = workspace.workspaceId ? { workspaceId: workspace.workspaceId } : { cwd: workspace.path };
+        } else if (typeof workspace === "string" && workspace) {
+            payload = { workspaceId: workspace };
+        }
         return this.call("session.create", payload);
     }
     async prompt(sessionId, textOrParts, mode = "queue") {
