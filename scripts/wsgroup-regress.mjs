@@ -168,6 +168,7 @@ try {
     } catch (e) {
         check("收尾：探针会话已归档、临时工作区已删除（无残留）", false, e.message);
     }
+    try { fs.rmSync(probeDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
     mux.stop();
     console.log(`\n${pass}/${pass + fail} passed`);
     process.exit(fail ? 1 : 0);
