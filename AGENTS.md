@@ -36,6 +36,7 @@
 - **底栏统计（v0.7.3 起，`STATS-PURE` 块，回归 `node scripts/stats-regress.mjs`，当前 11 用例，对齐 VSCode v0.18.1）**：输入=总输入（cacheRead+uncached）、缓存命中%=cacheRead/总输入、K/M 缩写、零值不显示（旧实现只显示 uncached，量级差 ~8 倍）。
 - **用户提问应答（v0.7.1 起）**：`ask_user_question` 答案编码在 `QUESTION-PURE` 标记块（`questionAnswer`），契约是 `{answers:[{id, selected:string[], custom?}]}`——selected 必须是数组、id 回显，改这里必跑 `node scripts/question-regress.mjs`（当前 13 用例）。**九个回归全绿才算改完**（fold / question / fence / auth / model / stats / wsgroup / args-audit / execute-regress）；动启动链路另跑 `startup-regress`。
 - **真机验证脚本**（`D:\02-bywork\tmp-plugin-debug\`，抓包用、非交付物）：`verify-v073.mjs`（一次跑完：多步正文还原 + 会话真实模型 vs 全局默认 + token 口径；自建临时会话并自动删除）、`live.mjs`（新会话发一条→实时流+快照两条路径跑插件 fold）、`shape.mjs`（快照事件形状 + fold 结果）、`order.mjs <sid>`（任意会话事件次序）、`scan-shapes.mjs`（全库会话正文存储形态统计）、`model-probe{,2}.mjs`（模型契约探针：catalog/modelSelection/回执）、`wsgroup.mjs`（服务器契约 A/B：cwd=未分组 / workspaceId=已分组）、`wsgroup-plugin-e2e.cjs` + `obsidian-stub.cjs`（真代码路径端到端；已固化为交付用的 `scripts/wsgroup-regress.mjs`）、`patch-wsgroup{,2}.mjs`（带「旧串恰好出现一次」断言的补丁脚本）。
+- **测试残留清理（v0.7.5 起，`scripts/session-purge.mjs`）**：DSH **没有删除会话的 API**，只有 `workspace/archiveSession`＝侧栏隐藏，文件照旧留在 `~/.dsh/sessions/--<cwd slug>--/session-<id>/` 与 `~/.dsh/storages/session_projcache/sessions/`。所以「跑完不留残留」＝**归档 + 删文件**两件事，缺一不可；建会话的回归（`execute-regress` / `wsgroup-regress`）收尾都已内建 `purgeSessionFiles(sid)` 并断言 `logDirOf(sid) === null`。归档集里的 id 会留下——无害，DSH 本就容忍「有归档 id、盘上无文件」的历史条目（写那个文件要停宿主，不值得）。**教训**：v0.7.4 之前本仓库回归只归档不删文件，VSCode 仓库的 `smoke.mjs` 连归档都没做 → 用户侧的表现是「DSH 未分组里莫名多出两个测试会话」。全球清扫用 `D:\02-bywork\tmp-plugin-debug\session-cleanup.mjs`（`stale` 列可疑残留 / `purge <id...>` 删 / `ghosts`+`sweep` 清无主投影缓存——运行中的宿主会把热会话的缓存重写回来，那份是纯派生垃圾）。
 - 对齐基准是 vscode 插件仓库 `D:\03-Projects\Plugins\dsh-vscode`（webview/src 是视觉与行为规格的权威；`CHANGELOG.md` 顶部是它最近的行为变更，同步前先比对现状，只补真缺口）。**当前对齐到 VSCode v0.18.5**：v0.7.5 补上了它的 `commands/execute` 参数改名、启动命令「显式优先 + 自动探测 + 陈旧值绕过」、以及 args 审计脚本这三项。
 
 ## 发版流程（每次改完顺手做，缺一不可）
@@ -51,6 +52,15 @@ Obsidian 的更新机制只认 GitHub Release——光 push 代码用户拉不�
    - 创建：`POST /repos/wuruihi/obsidian-deepseek-harness-native/releases`
    - 传附件：`POST uploads.github.com/.../releases/{id}/assets?name=<文件>`，Content-Type `application/octet-stream`
 6. GET Release 核验：非 draft、非 prerelease、三附件齐全
+
+## 收尾清理（每次改完顺手做，与发版并列）
+
+任务过程中产出的残留一律删掉，别留给用户在界面上撞见：
+
+1. **测试会话**：建会话的回归收尾已内建归档 + 删文件（见上「测试残留清理」）；手工建的会话用 `node D:\02-bywork\tmp-plugin-debug\session-cleanup.mjs stale` 找、`purge <sessionId>` 删
+2. **无主投影缓存**：`node ... session-cleanup.mjs sweep`（宿主重启后再跑一次能清到 0）
+3. **临时文件**：`%TEMP%` 下的探针脚本/夹具/临时工作区、调试日志（`.err.log` / 中间产物）一律删；回归脚本必须能在 `finally` 里自清理（含 `%TEMP%` 夹具目录）
+4. 核验方式：`session-cleanup.mjs stale` 与 `ghosts` 都为 0；`%TEMP%` 下残留本次任务前缀的目录为空
 
 ## 红线
 

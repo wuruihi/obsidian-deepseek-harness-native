@@ -12,13 +12,15 @@
 //   鉴权链（credentials → cookie）+ {args} 信封打真机。既断言「旧写法必须被拒」，也断言
 //   「插件真实入口 executeCommand 必须通」，所以字段名被改回去会立刻红。
 //
-// 红线：cookie/令牌值不打印、不落盘。副作用：临时目录建一次性工作区 + 探针会话，跑完归档并删除。
+// 红线：cookie/令牌值不打印、不落盘。副作用：临时目录建一次性工作区 + 探针会话；
+//   跑完归档**并删文件**（DSH 没有删除会话的 API，归档只是侧栏隐藏，见 scripts/session-purge.mjs）。
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { logDirOf, purgeSessionFiles } from "./session-purge.mjs";
 
 const require2 = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -171,10 +173,13 @@ try {
         if (sid && !archived) { archived = true; await api.call("workspace.archiveSession", { sessionId: sid }).catch(() => {}); }
         if (wsId) await api.call("workspace.delete", { workspaceId: wsId });
         const after = (await api.listWorkspaces()).items || [];
-        check("收尾：探针会话已归档、临时工作区已删除（无残留）",
-            after.filter((w) => samePath(w.path, probeDir)).length === 0, `剩余工作区 ${after.length} 个`);
+        // 归档只让侧栏不显示；文件还留在 ~/.dsh 下，必须再删（DSH 没有删除会话的 API）
+        const purged = sid ? purgeSessionFiles(sid) : [];
+        check("收尾：探针会话已归档 + 文件已删、临时工作区已删除（无残留）",
+            after.filter((w) => samePath(w.path, probeDir)).length === 0 && (!sid || logDirOf(sid) === null),
+            `剩余工作区 ${after.length} 个，清理文件 ${purged.length} 项`);
     } catch (e) {
-        check("收尾：探针会话已归档、临时工作区已删除（无残留）", false, brief(e && e.message || e));
+        check("收尾：探针会话已归档 + 文件已删、临时工作区已删除（无残留）", false, brief(e && e.message || e));
     }
     try { fs.rmSync(probeDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
     mux.stop();

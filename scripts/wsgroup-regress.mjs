@@ -10,13 +10,15 @@
 //   ③用插件自己的代码（含真实鉴权链 credentials → cookie、v012 {args} 信封、流桥）打真机。
 // 这样 main.js 里的映射逻辑一旦被改坏，本回归立刻红，而不是靠读代码确认。
 //
-// 红线：cookie/令牌值不打印、不落盘。副作用：在系统临时目录建一次性工作区 + 探针会话，跑完归档并删除。
+// 红线：cookie/令牌值不打印、不落盘。副作用：在系统临时目录建一次性工作区 + 探针会话；
+//   跑完归档**并删文件**（DSH 没有删除会话的 API，归档只是侧栏隐藏，见 scripts/session-purge.mjs）。
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { logDirOf, purgeSessionFiles } from "./session-purge.mjs";
 
 const require2 = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -163,10 +165,13 @@ try {
         for (const sid of probeSids) await api.call("workspace.archiveSession", { sessionId: sid }).catch(() => {});
         if (wsId) await api.call("workspace.delete", { workspaceId: wsId });
         const after = (await api.listWorkspaces()).items || [];
-        check("收尾：探针会话已归档、临时工作区已删除（无残留）",
-            after.filter((w) => samePath(w.path, probeDir)).length === 0, `剩余工作区 ${after.length} 个`);
+        // 归档只让侧栏不显示；文件还留在 ~/.dsh 下，必须再删（DSH 没有删除会话的 API）
+        const purged = probeSids.flatMap((sid) => purgeSessionFiles(sid));
+        check("收尾：探针会话已归档 + 文件已删、临时工作区已删除（无残留）",
+            after.filter((w) => samePath(w.path, probeDir)).length === 0 && probeSids.every((sid) => logDirOf(sid) === null),
+            `剩余工作区 ${after.length} 个，清理文件 ${purged.length} 项`);
     } catch (e) {
-        check("收尾：探针会话已归档、临时工作区已删除（无残留）", false, e.message);
+        check("收尾：探针会话已归档 + 文件已删、临时工作区已删除（无残留）", false, e.message);
     }
     try { fs.rmSync(probeDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
     mux.stop();
