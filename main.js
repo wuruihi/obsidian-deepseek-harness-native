@@ -61,10 +61,17 @@ const VIEW_TYPE = "dsh-native-view";
 
 const DEFAULT_DSH_REPO_URL = "https://github.com/deepseek-ai/deepseek-harness.git";
 
+/** 0.7.4 及更早版本内置过的启动命令：写死了作者机器的绝对路径（含用户名）。
+ *  读到这个值一律当作「未设置」→ 交给自动探测（换机/改用户名后它必然失效）。 */
+const LEGACY_STARTUP_COMMANDS = [
+    'node "C:\\Users\\wurui\\deepseek-harness\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" web --port {port}',
+];
+
 const DEFAULT_SETTINGS = {
     port: 3080,
-    startupCommand:
-        'node "C:\\Users\\wurui\\deepseek-harness\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" web --port {port}',
+    // 留空 = 自动探测本机 DSH 安装（见 detectDsh）。**不要**在这里写死任何机器专属路径：
+    // 那正是「一键启动永远 120s 超时」的根因（VSCode 插件 0.18.5 同款事故）。
+    startupCommand: "",
     autoStart: true,
     detached: true,
     vaultPath: "", // 空 = 用 app.vault.adapter.basePath
@@ -106,13 +113,73 @@ function defaultDshCandidates(homeDir, cwd) {
     cwd = cwd || process.cwd();
     const winPaths = process.platform === "win32" ? ["D:\\deepseek-harness", "C:\\deepseek-harness"] : [];
     const posixPaths = process.platform === "darwin" ? ["/opt/deepseek-harness", "/usr/local/deepseek-harness"] : [];
-    return [...new Set([cwd, path.join(homeDir, "deepseek-harness"), ...posixPaths, ...winPaths].filter(Boolean))];
+    // ~/dsh 是 npm 部署形态（本机真实布局）；具体布局排在宽泛路径之前
+    return [...new Set([
+        cwd,
+        path.join(homeDir, "dsh"),
+        path.join(homeDir, "deepseek-harness"),
+        ...posixPaths,
+        ...winPaths,
+    ].filter(Boolean))];
 }
 function hasBin(name) {
     const cp = require("child_process");
     const probe = process.platform === "win32" ? "where" : "which";
     try { cp.execFileSync(probe, [name], { stdio: "ignore" }); return true; }
     catch (_e) { return false; }
+}
+/** npm 部署形态判定：<dir>/node_modules/@deepseek-ai/dsh/lib/bin.js。
+ *  本机 ~/dsh 就是这种（无 .git、package.json 既无 name 也无 scripts）——isDshRepo 那套
+ *  「仓库特征」判定认不出它，所以「装没装 dsh」必须按结构问，不能按仓库特征猜。 */
+function dshBinInDir(dir) {
+    const fs = require("fs");
+    const path = require("path");
+    if (!dir) return null;
+    const bin = path.join(dir, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+    try { return fs.existsSync(bin) ? bin : null; } catch (_e) { return null; }
+}
+/** 派生启动命令。node 用裸名交给 shell 解析（Electron 的 process.execPath 是 Obsidian.exe，不能用） */
+function nodeCommandFor(binPath) {
+    const quoted = /\s/.test(binPath) ? '"' + binPath + '"' : binPath;
+    return `node ${quoted} web --port {port}`;
+}
+/** 命令里显式引用的脚本是否存在（只查绝对路径形态的 *.js，不碰 PATH 上的裸命令） */
+function missingScriptOf(command) {
+    const fs = require("fs");
+    const tk = tokenizeCommand(command);                 // { command, args }
+    const tokens = [tk.command, ...(tk.args || [])].filter(Boolean);
+    for (const t of tokens.slice(0, 3)) {
+        if (!/\.(js|cjs|mjs)$/i.test(t)) continue;
+        if (!/^([A-Za-z]:[\\/]|\\\\|\/)/.test(t)) continue;
+        try { if (!fs.existsSync(t)) return t; } catch (_e) { /* ignore */ }
+    }
+    return null;
+}
+/** 启动命令解析：设置里的显式命令优先；但**升级遗留 / 换机后失效**的显式路径会被
+ *  报出并绕过，回退到自动探测——不能让陈旧配置变成「120 秒无声超时」。
+ *  （对齐 VSCode 插件 v0.18.5：stale explicit path 要 reported AND bypassed） */
+function resolveStartupCommand(configured, homeDir, cwd) {
+    const raw = String(configured || "").trim();
+    const isLegacy = LEGACY_STARTUP_COMMANDS.includes(raw);
+    if (raw && !isLegacy) {
+        const miss = missingScriptOf(raw);
+        if (!miss) return { command: raw, source: "设置里的启动命令", warning: "" };
+        const d = detectDsh(homeDir, cwd);
+        return {
+            command: d.found ? d.startupCommand : raw,
+            source: d.found ? "自动探测（设置里的命令已失效）" : "设置里的启动命令（引用的文件不存在）",
+            warning: "设置里的启动命令引用的文件不存在：" + miss +
+                (d.found ? "；已改用自动探测到的命令：" + d.startupCommand
+                    : "；自动探测也没找到 DSH，启动大概率仍会失败"),
+        };
+    }
+    const d = detectDsh(homeDir, cwd);
+    if (!d.found) return { command: "", source: "未探测到 DSH", warning: d.message };
+    return {
+        command: d.startupCommand,
+        source: "自动探测：" + d.message,
+        warning: isLegacy ? "设置里的启动命令来自 0.7.4 内置的机器专属默认值，已忽略并改用自动探测" : "",
+    };
 }
 function detectDsh(homeDir, cwd) {
     // 1) PATH 里有没有 dsh
@@ -126,9 +193,24 @@ function detectDsh(homeDir, cwd) {
             message: "已在 PATH 中找到 dsh（直接用 `dsh web` 启动）",
         };
     }
-    // 2) 常见目录扫描
+    const probed = defaultDshCandidates(homeDir, cwd);
+    // 2) npm 部署形态（结构判定，本机 ~/dsh 走这条）
+    for (const dir of probed) {
+        const bin = dshBinInDir(dir);
+        if (bin) {
+            return {
+                found: true,
+                kind: "install",
+                dir,
+                startupCommand: nodeCommandFor(bin),
+                startupCwd: dir,
+                message: "已找到 DSH 部署：" + dir,
+            };
+        }
+    }
+    // 3) 源码仓库形态（有 pnpm-workspace.yaml / package.json 带 dsh script）
     const fs = require("fs");
-    for (const dir of defaultDshCandidates(homeDir, cwd)) {
+    for (const dir of probed) {
         if (fs.existsSync(dir) && isDshRepo(dir)) {
             const cmd = hasBin("pnpm") ? "pnpm dsh web --port {port}" : "npm run dsh -- web --port {port}";
             return {
@@ -141,7 +223,10 @@ function detectDsh(homeDir, cwd) {
             };
         }
     }
-    return { found: false, kind: "none", dir: "", startupCommand: "", startupCwd: "", message: "未检测到 DSH 安装（PATH 与常见目录均无）" };
+    return {
+        found: false, kind: "none", dir: "", startupCommand: "", startupCwd: "", probed,
+        message: "未检测到 DSH 安装（PATH 里没有 dsh，已探测：" + probed.join("、") + "）",
+    };
 }
 /** 用 spawn 跑一条命令并实时把进度通过 onStep 回调上抛（避免长任务阻塞 UI） */
 function spawnStep(cmd, args, opts, onStep) {
@@ -345,9 +430,13 @@ class ServiceManager {
     }
     start() {
         if (this.disposed || this.child) return;
-        const { command, args } = tokenizeCommand(this.opts.startupCommand);
+        // 显式配置优先；但失效的显式路径会被报出并绕过 → 回退自动探测（见 resolveStartupCommand）
+        const resolved = resolveStartupCommand(this.opts.startupCommand, this.opts.home, this.opts.startupCwd);
+        if (resolved.warning) console.warn("[dsh-native] " + resolved.warning);
+        this.startupSource = resolved.source;
+        const { command, args } = tokenizeCommand(resolved.command);
         if (!command) {
-            this.spawnError = "启动命令为空，请在设置里填写";
+            this.spawnError = "启动命令为空，且未自动探测到 DSH 安装；请在设置里填启动命令，或用「一键检测并填入」";
             return;
         }
         const child = spawnLaunch(command, args, this.opts.startupCwd, this.opts.detached);
@@ -799,22 +888,34 @@ class DshAuth {
             return false;
         } catch (_e) { return false; }
     }
-    /** 日志尾捞启动 token（自家服务 / ~/.dsh 下最新 .log） */
+    /** 日志尾捞启动 token（自家服务 / ~/.dsh / 安装目录下的最新 .log）。
+     *  两个实测坑：①只扫 ~/.dsh 会漏掉启动器写的 <安装目录>/logs（本机就在 ~/dsh/logs）；
+     *  ②一个文件里可能有多轮启动的 token，取第一个往往已过期 → 取**最后**一个。 */
     async discoverToken() {
         const fs = require("fs");
+        const path = require("path");
         const home = this.opts.home || "";
+        const dirs = [
+            path.join(home, ".dsh", "logs"),
+            path.join(home, ".dsh"),
+            path.join(home, "dsh", "logs"),                 // 本机部署形态（启动器每轮日志写这里）
+            path.join(home, "dsh"),
+            path.join(home, "deepseek-harness", "logs"),
+            path.join(home, "deepseek-harness"),
+        ];
         const candidates = [];
-        try {
-            for (const dir of [require("path").join(home, ".dsh", "logs"), require("path").join(home, ".dsh")]) {
-                const names = fs.readdirSync(dir).filter((n) => n.endsWith(".log"));
-                const withTime = names.map((n) => {
-                    const p = require("path").join(dir, n);
-                    return { path: p, mtime: fs.statSync(p).mtimeMs };
-                }).sort((a, b) => b.mtime - a.mtime);
-                candidates.push(...withTime.map((x) => x.path));
-            }
-        } catch (_e) { /* best effort */ }
-        for (const file of candidates) {
+        for (const dir of dirs) {
+            try {
+                for (const n of fs.readdirSync(dir)) {
+                    if (!n.endsWith(".log")) continue;
+                    const p = path.join(dir, n);
+                    candidates.push({ path: p, mtime: fs.statSync(p).mtimeMs });
+                }
+            } catch (_e) { /* best effort */ }
+        }
+        candidates.sort((a, b) => b.mtime - a.mtime);
+        for (const cand of candidates) {
+            const file = cand.path;
             try {
                 const st = fs.statSync(file);
                 const fh = fs.openSync(file, "r");
@@ -822,8 +923,8 @@ class DshAuth {
                 const buf = Buffer.alloc(st.size - start);
                 fs.readSync(fh, buf, 0, buf.length, start);
                 fs.closeSync(fh);
-                const m = /token=([A-Za-z0-9_-]+)/.exec(buf.toString("utf8"));
-                if (m) return m[1];
+                const ms = [...buf.toString("utf8").matchAll(/token=([A-Za-z0-9_-]+)/g)];
+                if (ms.length) return ms[ms.length - 1][1];
             } catch (_e) { /* next */ }
         }
         return undefined;
@@ -1265,10 +1366,13 @@ class DshApi {
         if (method === "skill.list") return this.v012Request("skills/list", { request: { sessionId: payload && payload.sessionId } });
         if (method === "commands/list") return this.v012Request("commands/list", { agentId: payload && payload.args && payload.args.agentId });
         if (method === "commands/execute") {
+            // 0.1.5 起网关参数改名：images → submittedAttachments（typert 逐参数精确匹配，
+            // 多键/缺键都拒）。旧键会让权限切换与所有斜杠命令静默失败——真机回归
+            // scripts/execute-regress.mjs 守这条契约，改回去立刻红。
             return this.v012Request("commands/execute", {
                 agentId: payload && payload.args && payload.args.agentId,
                 line: payload && payload.args && payload.args.line,
-                images: (payload && payload.args && payload.args.images) || [],
+                submittedAttachments: (payload && payload.args && payload.args.submittedAttachments) || [],
             });
         }
         if (method === "settings.mutate") {
@@ -6551,8 +6655,8 @@ class DshNativeSettingTab extends PluginSettingTab {
                 }
             })
         );
-        new Setting(containerEl).setName("启动命令").setDesc("启动 dsh web 的命令，{port} 自动替换。必须以 vault 为 cwd 启动（见 CLAUDE.md）。").addText((t) =>
-            t.setPlaceholder('node "..."\\bin.js web --port {port}').setValue(this.plugin.settings.startupCommand).onChange(async (v) => {
+        new Setting(containerEl).setName("启动命令").setDesc("留空 = 自动探测本机 DSH 安装（推荐，跨机器可用）；也可手填，{port} 自动替换。必须以 vault 为 cwd 启动（见 AGENTS.md）。").addText((t) =>
+            t.setPlaceholder("留空 = 自动探测").setValue(this.plugin.settings.startupCommand).onChange(async (v) => {
                 this.plugin.settings.startupCommand = v;
                 await this.plugin.saveSettings();
             })
@@ -7252,6 +7356,11 @@ class DshNativePlugin extends Plugin {
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        // 0.7.4 及更早把「机器专属启动命令」作为默认值存进了 data.json；只改默认值救不了
+        // 已经落过盘的机器 → 读到旧值一律按「未设置」处理，交给自动探测。
+        if (LEGACY_STARTUP_COMMANDS.includes(String(this.settings.startupCommand || "").trim())) {
+            this.settings.startupCommand = "";
+        }
     }
     async saveSettings() {
         await this.saveData(this.settings);
