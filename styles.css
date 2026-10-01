@@ -1396,6 +1396,32 @@ select.dsh-chip-btn { max-width: 220px; }
     white-space: nowrap;
 }
 
+/* ── 设置页「高级」折叠区（对齐 dsh-vscode 0.21.x 的「高级（服务器设置）」）─────
+   设置页第一屏只留常用项，技术项收进 <details> 默认收起。Obsidian 没有原生
+   折叠分组，所以自带一套轻样式；颜色全部走 Obsidian 核心变量（有主题兜底语义），
+   不依赖任何可能缺省的变量。 */
+.dsh-advanced-settings {
+    margin-top: 18px;
+    border-top: 1px solid var(--background-modifier-border);
+    padding-top: 4px;
+}
+.dsh-advanced-settings > summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--text-muted);
+    padding: 6px 0;
+    list-style: none;
+}
+.dsh-advanced-settings > summary:hover {
+    color: var(--text-normal);
+}
+.dsh-advanced-settings[open] > summary {
+    color: var(--text-normal);
+}
+.dsh-advanced-body {
+    padding-left: 2px;
+}
+
 
 
 

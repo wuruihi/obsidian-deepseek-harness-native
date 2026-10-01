@@ -2984,6 +2984,32 @@ function modelMemoryWorthy(row, sameWorkspace) {
 }
 /* ==== MODEL-PURE-END ==== */
 
+/* ==== PERM-PURE-BEGIN — 会话级权限现值归一化（回归：node scripts/perm-regress.mjs） ====
+   为什么需要它（对齐 dsh-vscode 0.21.1 复核抓到的同类修正）：
+   `settings/describe` 的 `permission.defaultPreset` 是**服务器全局默认**——只影响
+   「未来新建的会话」；某个会话**当前**用的预设只在该会话的 `permissions` 投影里。
+   旧实现把全局默认当成"当前会话预设"显示，于是切到没有投影推送的会话时，
+   下拉里显示的是别的来源的值（用户以为这个会话就是这个预设）。
+   载荷三种形态都要认：裸字符串 / `{values:{permissions}}`（历史快照）/ `{permissions}`（投影帧）。 */
+function permissionValueOf(projections) {
+    if (!projections || typeof projections !== "object") return null;
+    const p = (projections.values && typeof projections.values === "object")
+        ? projections.values.permissions
+        : projections.permissions;
+    return permissionIdOf(p);
+}
+
+/** 单个 permissions 值 → 预设 id（认字符串与几种对象字段；认不出返回 null，不许编值）。 */
+function permissionIdOf(p) {
+    if (typeof p === "string") return p || null;
+    if (p && typeof p === "object") {
+        const v = p.currentValue || p.currentPreset || p.preset || p.value || p.name;
+        return typeof v === "string" && v ? v : null;
+    }
+    return null;
+}
+/* ==== PERM-PURE-END ==== */
+
 /* ==== STATS-PURE-BEGIN — 底栏 token 口径（回归：node scripts/stats-regress.mjs） ====
  * 与 dsh 本体 GUI / VSCode v0.18.1 对齐（实测校准）：
  *   tokenUsage = {uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}
@@ -3074,6 +3100,10 @@ class DshNativeView extends ItemView {
         // v0.7.3：sessionId → 会话真实模型 {provider, model, reasoningEffort?}
         // （来自 modelSelection 投影 / selectModel 回执；catalog 的 default 永不入此表）
         this._sessionModels = new Map();
+        // v0.7.6：sessionId → 该会话**已确认**的权限预设 id（来自 permissions 投影 / 历史
+        // 快照）。服务器 settings 里的 defaultPreset 是"未来会话的默认"，**不入此表**——
+        // 拿它冒充当前会话的值就是这个下拉曾经显示错值的根因（对齐 dsh-vscode 0.21.1）。
+        this._sessionPerms = new Map();
         // Phase 6：附件（@ 文件补全 / 图片粘贴）
         this._attachments = [];      // [{kind:"file", file:TFile} | {kind:"image", part:{type,image,...}}]
         this._vaultMdFiles = null;   // 懒缓存：vault 内 markdown 文件列表
@@ -4452,22 +4482,39 @@ class DshNativeView extends ItemView {
     }
     async loadPermissions() {
         if (!this.permSelect) return;
+        const asked = this.sessionId;
         try {
+            // presets / revision 来自 settings.describe（枚举与写入基线）；
+            // **选中值只认本会话已确认的权限**（sessionPermChoice）——服务器里那份是
+            // "未来会话的默认"，拿它冒充当前会话的值会显示错值（对齐 dsh-vscode 0.21.1）。
             const r = await this.api.getPermissionPreset();
+            if (asked !== this.sessionId) return; // 期间切了会话：这次结果作废
             const presets = Array.isArray(r.presets) ? r.presets : [];
-            const cur = r.value;
             this._permRevision = r.revision;
+            const cur = this.sessionPermChoice(asked) || null;
             this.permSelect.empty();
             if (presets.length === 0) {
-                // 没枚举到选项：单值展示 + 不可切换
+                // 没枚举到选项：只展示（已知值优先），不可切换
                 const opt = this.permSelect.createEl("option", { value: cur || "" });
                 opt.textContent = cur || "未配置";
                 this.permSelect.disabled = true;
             } else {
+                if (!cur) {
+                    // 本会话的值还没到（投影/快照都没给）：明确说"未知"，不拿默认冒充
+                    const ph = this.permSelect.createEl("option", { value: "" });
+                    ph.textContent = "（本会话预设未知）";
+                    ph.selected = true;
+                }
                 for (const p of presets) {
                     const opt = this.permSelect.createEl("option", { value: p.id });
                     opt.textContent = p.label || p.id;
                     if (p.id === cur) opt.selected = true;
+                }
+                // 已知值不在枚举里：补一个，避免下拉显示成第一个选项（那还是错值）
+                if (cur && !presets.some((p) => p.id === cur)) {
+                    const opt = this.permSelect.createEl("option", { value: cur });
+                    opt.textContent = cur;
+                    opt.selected = true;
                 }
                 this.permSelect.disabled = false;
             }
@@ -4477,6 +4524,22 @@ class DshNativeView extends ItemView {
             opt.textContent = "加载失败";
             this.permSelect.disabled = true;
         }
+    }
+
+    /** 把下拉选中项对齐到某个预设 id（选项不存在则补一个）。投影到达时用。 */
+    applyPermSelection(cur) {
+        if (!this.permSelect || !cur) return;
+        for (const opt of Array.from(this.permSelect.options)) {
+            if (opt.value === cur) {
+                opt.selected = true;
+                this.permSelect.disabled = false;
+                return;
+            }
+        }
+        const opt = this.permSelect.createEl("option", { value: cur });
+        opt.textContent = cur;
+        opt.selected = true;
+        this.permSelect.disabled = false;
     }
     async switchPermission() {
         const target = this.permSelect.value;
@@ -5596,6 +5659,10 @@ class DshNativeView extends ItemView {
             // 后续 loadModels 才会显示这个会话真正在跑的模型，而不是宿主全局默认。
             const msReal = realModelOf(modelSelectionOf(h && h.projections));
             if (msReal && this._setSessionModel(id, msReal) && this.sessionId === id) void this.loadModels();
+            // v0.7.6：同一份快照里也带 permissions（会话级权限现值）——种下它，
+            // 权限下拉才不会在该会话没有实时投影时显示成服务器默认值。
+            const permReal = permissionValueOf(h && h.projections);
+            if (permReal && this._setSessionPerm(id, permReal) && this.sessionId === id) void this.loadPermissions();
             // 记录翻页边界（events 按时间正序，[0] 是最旧一条的 seq）
             if (events.length) {
                 const firstSeq = events[0].event && events[0].event.seq;
@@ -6066,6 +6133,23 @@ class DshNativeView extends ItemView {
         return this._sessionModels.get(sessionId || this.sessionId);
     }
 
+    /** v0.7.6：记下某会话**已确认**的权限预设（来自 permissions 投影 / 历史快照）。
+     *  会话级 Map：切会话不用清、也不会被别的会话的推送覆盖（与 _sessionModels 同一套路）。
+     *  返回是否有变化。 */
+    _setSessionPerm(sessionId, value) {
+        const v = permissionIdOf(value);
+        if (!sessionId || !v) return false;
+        if (this._sessionPerms.get(sessionId) === v) return false;
+        this._sessionPerms.set(sessionId, v);
+        return true;
+    }
+
+    /** 当前会话已确认的权限预设；未知返回 undefined——调用方必须显示"未知"，
+     *  不许拿服务器全局默认（只影响未来会话）冒充（对齐 dsh-vscode 0.21.1）。 */
+    sessionPermChoice(sessionId) {
+        return this._sessionPerms.get(sessionId || this.sessionId);
+    }
+
     handleSessionEvent(ev) {
         if (!ev) return;
         // 精确过滤 WS 重放：历史已从 REST 渲染后，记录了最后一条事件的 seq。
@@ -6269,30 +6353,17 @@ class DshNativeView extends ItemView {
             this._todos = Array.isArray(p.value) ? p.value : null;
             this.renderPlanStrip();
         } else if (p.key === "permissions") {
-            // 实时更新当前权限值（投影通道），并刷新 revision 以便下次写入不冲突
-            if (!this.permSelect) return;
-            const v = p.value;
-            let cur = null;
-            if (typeof v === "string") cur = v;
-            else if (v && typeof v === "object") {
-                cur = v.currentPreset || v.currentValue || v.preset || v.value || v.name || null;
-            }
-            // 先看现有 option 里有没有；没有则临时塞一个
+            // 会话级权限现值（投影通道）。必须先**入会话级 Map** 再更新下拉：
+            // 投影只推变化，切回旧会话时不会重放，只有 Map 才能显示"那个会话自己的值"
+            // （旧实现只改 DOM ⇒ 切会话后残留上一个会话的选中项；对齐 dsh-vscode 0.21.1）。
+            const cur = permissionIdOf(p.value);
             if (cur) {
-                let exists = false;
-                for (const opt of Array.from(this.permSelect.options)) {
-                    if (opt.value === cur) { opt.selected = true; exists = true; break; }
-                }
-                if (!exists) {
-                    const opt = this.permSelect.createEl("option", { value: cur });
-                    opt.textContent = cur;
-                    opt.selected = true;
-                    this.permSelect.disabled = false;
-                }
+                this._setSessionPerm(this.sessionId, cur);
+                this.applyPermSelection(cur);
             }
             // revision 同步过来（projection 也带 revision）
             if (typeof p.seq === "number") this._permRevision = p.seq;
-            if (typeof p.revision === "number") this._permRevision = p.revision;
+            else if (typeof p.revision === "number") this._permRevision = p.revision;
         }
     }
 
@@ -6637,47 +6708,16 @@ class DshNativeSettingTab extends PluginSettingTab {
     display() {
         const { containerEl } = this;
         containerEl.empty();
-        const buildTag = (this.plugin && this.plugin._buildTag) || "?";
-        new Setting(containerEl)
-            .setName("插件版本")
-            .setDesc("当前加载的 main.js 构建标识（反馈问题时对照用）。")
-            .addText((t) => t.setValue(buildTag).setDisabled(true));
-        new Setting(containerEl)
-            .setName("插件作者")
-            .setDesc("本插件的作者。")
-            .addText((t) => t.setValue("wupang").setDisabled(true));
-        new Setting(containerEl).setName("服务端口").setDesc("DSH Web 服务端口，默认 3080。").addText((t) =>
-            t.setPlaceholder("3080").setValue(String(this.plugin.settings.port)).onChange(async (v) => {
-                const n = parseInt(v, 10);
-                if (!isNaN(n)) {
-                    this.plugin.settings.port = n;
-                    await this.plugin.saveSettings();
-                }
-            })
-        );
-        new Setting(containerEl).setName("启动命令").setDesc("留空 = 自动探测本机 DSH 安装（推荐，跨机器可用）；也可手填，{port} 自动替换。必须以 vault 为 cwd 启动（见 AGENTS.md）。").addText((t) =>
-            t.setPlaceholder("留空 = 自动探测").setValue(this.plugin.settings.startupCommand).onChange(async (v) => {
-                this.plugin.settings.startupCommand = v;
-                await this.plugin.saveSettings();
-            })
-        );
-        new Setting(containerEl).setName("自动启动").setDesc("打开面板时若端口无服务，自动运行启动命令。").addToggle((t) =>
-            t.setValue(this.plugin.settings.autoStart).onChange(async (v) => {
-                this.plugin.settings.autoStart = v;
-                await this.plugin.saveSettings();
-            })
-        );
-        new Setting(containerEl).setName("Vault 路径").setDesc("DSH 工作区绑定的文件夹；留空则用当前 vault 根目录。").addText((t) =>
-            t.setPlaceholder(this.plugin.app.vault.adapter.basePath).setValue(this.plugin.settings.vaultPath).onChange(async (v) => {
-                this.plugin.settings.vaultPath = v.trim();
-                await this.plugin.saveSettings();
-            })
-        );
-
-        // ===== DSH 安装状态 =====
         const os = require("os");
         const path = require("path");
         const defaultInstallDir = this.plugin.settings.installDir || path.join(os.homedir(), "deepseek-harness");
+
+        // ===== 常用（人话在这：日常真正会动的几条）=====
+        // 对齐 dsh-vscode 0.21.x：第一屏只放"看得懂、也能改"的设置；内部名/技术项
+        // （启动命令、Vault 路径、安装目录、Token、版本指纹…）一律收进下方「高级」默认收起。
+        new Setting(containerEl).setName("常用").setHeading();
+
+        // 1) 安装状态放第一：这是唯一会让整个面板不可用的情况，坏了要能一键修
         new Setting(containerEl)
             .setName("DSH 安装状态")
             .setDesc("检查 DSH（@deepseek-ai/dsh）是否已安装；未安装时可一键克隆 + install。")
@@ -6711,25 +6751,30 @@ class DshNativeSettingTab extends PluginSettingTab {
                     new Notice("安装失败：" + result.message, 10000);
                 }
             }));
-        // 安装目标目录
-        new Setting(containerEl)
-            .setName("安装目标目录")
-            .setDesc("一键安装克隆到此目录。留空用 ~/deepseek-harness。")
-            .addText((t) =>
-                t.setPlaceholder(defaultInstallDir).setValue(this.plugin.settings.installDir).onChange(async (v) => {
-                    this.plugin.settings.installDir = v.trim();
-                    await this.plugin.saveSettings();
-                })
-            );
-        // 状态行
+        // 状态行（检测结果直接写在上面那一条的描述位）
         const statusRow = new Setting(containerEl).setName("状态").setDesc("");
         this._dshStatusEl = statusRow.descEl;
         this._dshStatusEl.style.fontFamily = "var(--font-monospace,monospace)";
-        // 首次进入页面就跑一次
-        const r = detectDsh();
-        this._dshStatus(r, defaultInstallDir);
+        this._dshStatus(detectDsh(), defaultInstallDir);
 
-        // ===== 收发模式（mode）=====
+        // 2) 连哪个服务：端口（对齐 VSCode「连哪个 DSH 实例」）
+        new Setting(containerEl).setName("服务端口").setDesc("DSH Web 服务端口，默认 3080。").addText((t) =>
+            t.setPlaceholder("3080").setValue(String(this.plugin.settings.port)).onChange(async (v) => {
+                const n = parseInt(v, 10);
+                if (!isNaN(n)) {
+                    this.plugin.settings.port = n;
+                    await this.plugin.saveSettings();
+                }
+            })
+        );
+        // 3) 找不到服务时自动拉起（对齐 VSCode「找不到实例时自动打开桌面版」）
+        new Setting(containerEl).setName("自动启动").setDesc("打开面板时若端口无服务，自动运行启动命令。").addToggle((t) =>
+            t.setValue(this.plugin.settings.autoStart).onChange(async (v) => {
+                this.plugin.settings.autoStart = v;
+                await this.plugin.saveSettings();
+            })
+        );
+        // 4) 发送模式（mode）
         new Setting(containerEl)
             .setName("发送模式")
             .setDesc("session.prompt 的 mode：queue（追加排队）/ steer（打断当前轮，DSH 决定是插入还是转下一条）。")
@@ -6743,8 +6788,23 @@ class DshNativeSettingTab extends PluginSettingTab {
                         await this.plugin.saveSettings();
                     })
             );
+        // 5) 收发：两个开关（都是"人话"，留在常用）
+        new Setting(containerEl).setName("框选发送按钮").setDesc("在编辑器框选文字后，选区旁显示「发送到 DSH」浮动按钮（命令面板与右键菜单始终可用）。").addToggle((t) =>
+            t.setValue(this.plugin.settings.selectionButton).onChange(async (v) => {
+                this.plugin.settings.selectionButton = v;
+                await this.plugin.saveSettings();
+                if (!v) this.plugin.hideSelectionButton();
+            })
+        );
+        new Setting(containerEl).setName("发送后自动打开面板").setDesc("从笔记发送文字到 DSH 后，自动打开/聚焦 DSH 面板查看回复。").addToggle((t) =>
+            t.setValue(this.plugin.settings.openPanelOnSend).onChange(async (v) => {
+                this.plugin.settings.openPanelOnSend = v;
+                await this.plugin.saveSettings();
+            })
+        );
 
-        // ===== 快捷操作 =====
+        // ===== 快捷操作（是动作，不是设置项）=====
+        new Setting(containerEl).setName("快捷操作").setHeading();
         new Setting(containerEl).setName("在浏览器打开 DSH").setDesc("用系统默认浏览器打开 DSH Web GUI（独立窗口，不受侧栏面板限制）。").addButton((b) =>
             b.setButtonText("打开").onClick(() => this.plugin.openDshInBrowser())
         );
@@ -6773,50 +6833,69 @@ class DshNativeSettingTab extends PluginSettingTab {
             })
         );
 
-        // ===== 收发 =====
-        new Setting(containerEl).setName("框选发送按钮").setDesc("在编辑器框选文字后，选区旁显示「发送到 DSH」浮动按钮（命令面板与右键菜单始终可用）。").addToggle((t) =>
-            t.setValue(this.plugin.settings.selectionButton).onChange(async (v) => {
-                this.plugin.settings.selectionButton = v;
-                await this.plugin.saveSettings();
-                if (!v) this.plugin.hideSelectionButton();
-            })
-        );
-        new Setting(containerEl).setName("发送后自动打开面板").setDesc("从笔记发送文字到 DSH 后，自动打开/聚焦 DSH 面板查看回复。").addToggle((t) =>
-            t.setValue(this.plugin.settings.openPanelOnSend).onChange(async (v) => {
-                this.plugin.settings.openPanelOnSend = v;
-                await this.plugin.saveSettings();
-            })
-        );
+        // ===== 高级：技术设置，默认收起（对齐 dsh-vscode 的「高级（服务器设置）」）=====
+        // 说明：Obsidian 没有原生"折叠分组"，用 <details> 实现；代价是设置搜索命中
+        // 高级项时不会自动展开（已知取舍，写在 docs 里）。
+        const adv = containerEl.createEl("details", { cls: "dsh-advanced-settings" });
+        adv.createEl("summary", { text: "高级（技术设置，通常不用动）" });
+        const advBody = adv.createDiv("dsh-advanced-body");
 
-        // ===== 高级 =====
-        new Setting(containerEl).setName("启动等待时间").setDesc("自动启动后等待服务就绪的最长时间（当前 " + Math.round(this.plugin.settings.readyTimeoutMs / 1000) + " 秒）；首次启动可能需 1–2 分钟。").addSlider((s) =>
+        new Setting(advBody).setName("启动命令").setDesc("留空 = 自动探测本机 DSH 安装（推荐，跨机器可用）；也可手填，{port} 自动替换。必须以 vault 为 cwd 启动（见 AGENTS.md）。").addText((t) =>
+            t.setPlaceholder("留空 = 自动探测").setValue(this.plugin.settings.startupCommand).onChange(async (v) => {
+                this.plugin.settings.startupCommand = v;
+                await this.plugin.saveSettings();
+            })
+        );
+        new Setting(advBody).setName("Vault 路径").setDesc("DSH 工作区绑定的文件夹；留空则用当前 vault 根目录。").addText((t) =>
+            t.setPlaceholder(this.plugin.app.vault.adapter.basePath).setValue(this.plugin.settings.vaultPath).onChange(async (v) => {
+                this.plugin.settings.vaultPath = v.trim();
+                await this.plugin.saveSettings();
+            })
+        );
+        new Setting(advBody)
+            .setName("安装目标目录")
+            .setDesc("一键安装克隆到此目录。留空用 ~/deepseek-harness。")
+            .addText((t) =>
+                t.setPlaceholder(defaultInstallDir).setValue(this.plugin.settings.installDir).onChange(async (v) => {
+                    this.plugin.settings.installDir = v.trim();
+                    await this.plugin.saveSettings();
+                })
+            );
+        new Setting(advBody).setName("启动等待时间").setDesc("自动启动后等待服务就绪的最长时间（当前 " + Math.round(this.plugin.settings.readyTimeoutMs / 1000) + " 秒）；首次启动可能需 1–2 分钟。").addSlider((s) =>
             s.setLimits(60, 600, 30).setValue(Math.round(this.plugin.settings.readyTimeoutMs / 1000)).onChange(async (v) => {
                 this.plugin.settings.readyTimeoutMs = v * 1000;
                 await this.plugin.saveSettings();
                 this.plugin.serviceManager.opts = this.plugin.getServiceOpts();
             })
         );
-        new Setting(containerEl).setName("进程独立常驻").setDesc("开启后，插件启动的 DSH 进程在 Obsidian 退出后继续运行（默认关：随 Obsidian 退出而终止）。").addToggle((t) =>
+        new Setting(advBody).setName("进程独立常驻").setDesc("开启后，插件启动的 DSH 进程在 Obsidian 退出后继续运行（默认关：随 Obsidian 退出而终止）。").addToggle((t) =>
             t.setValue(this.plugin.settings.detached).onChange(async (v) => {
                 this.plugin.settings.detached = v;
                 await this.plugin.saveSettings();
                 this.plugin.serviceManager.opts = this.plugin.getServiceOpts();
             })
         );
-        new Setting(containerEl).setName("安装地址").setDesc("克隆 DSH 的仓库地址；国内网络受限时可换代理镜像（如 https://gh-proxy.com/https://github.com/deepseek-ai/deepseek-harness.git）。").addText((t) =>
+        new Setting(advBody).setName("安装地址").setDesc("克隆 DSH 的仓库地址；国内网络受限时可换代理镜像（如 https://gh-proxy.com/https://github.com/deepseek-ai/deepseek-harness.git）。").addText((t) =>
             t.setPlaceholder(DEFAULT_DSH_REPO_URL).setValue(this.plugin.settings.installUrl).onChange(async (v) => {
                 this.plugin.settings.installUrl = v.trim() || DEFAULT_DSH_REPO_URL;
                 await this.plugin.saveSettings();
             })
         );
-        new Setting(containerEl).setName("鉴权 Token（兜底）").setDesc("DSH 0.1.2+ 需要鉴权。正常留空：插件自动从 ~/.dsh/.credentials.yaml 铸永久 cookie。仅在自动鉴权失败时，把浏览器地址栏里的启动 token 粘到这里。").addText((t) =>
+        new Setting(advBody).setName("鉴权 Token（兜底）").setDesc("DSH 0.1.2+ 需要鉴权。正常留空：插件自动从 ~/.dsh/.credentials.yaml 铸永久 cookie。仅在自动鉴权失败时，把浏览器地址栏里的启动 token 粘到这里。").addText((t) =>
             t.setPlaceholder("留空 = 自动铸 cookie").setValue(this.plugin.settings.authToken).onChange(async (v) => {
                 this.plugin.settings.authToken = v.trim();
                 await this.plugin.saveSettings();
                 if (this.plugin.auth) this.plugin.auth.invalidate(); // 下次请求重走鉴权链
             })
         );
+        // 版本指纹（只读）：回答"Obsidian 到底加载到哪一版 main.js"——以前这条在最顶上占位，
+        // 现在归入高级（日常不需要看，排障才要）。
+        new Setting(advBody)
+            .setName("插件版本")
+            .setDesc("当前加载的 main.js 构建标识（版本号取自 manifest + 加载时间；反馈问题时对照用）。")
+            .addText((t) => t.setValue((this.plugin && this.plugin._buildTag) || "?").setDisabled(true));
     }
+
     _dshStatus(r, defaultInstallDir) {
         if (!this._dshStatusEl) return;
         if (r.found) {
@@ -6852,7 +6931,10 @@ class DshNativePlugin extends Plugin {
         this._detecting = false;
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
-        const BUILD_TAG = "dsh-native-v0.7.0-" + new Date().toISOString();
+        // v0.7.6：版本号**从 manifest 派生**，不再硬编码。旧实现写死 "v0.7.0"，
+        // 于是装的是 0.7.5、设置页与 last_loaded.txt 却都显示 v0.7.0——
+        // 指纹本身成了误导源（对齐 dsh-vscode 0.21.1：身份标识必须反映真实构建）。
+        const BUILD_TAG = "dsh-native-v" + ((this.manifest && this.manifest.version) || "0") + "-" + new Date().toISOString();
         console.log("[dsh-native] BUILD_TAG =", BUILD_TAG);
         try {
             require("fs").writeFileSync(
