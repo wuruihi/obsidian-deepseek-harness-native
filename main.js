@@ -7071,7 +7071,7 @@ class DshNativePlugin extends Plugin {
         });
         this.api.bindAuth(this.auth);
         this.flavor = "legacy"; // 当前协议代（detectAndConnect 会刷新）
-        this._detecting = false;
+        this._detectPromise = null; // 在途的协议探测（并发调用复用它，见 detectAndConnect）
 
         // === 版本指纹（用于诊断"Obsidian 是否加载到新版 main.js"） ===
         // v0.7.6：版本号**从 manifest 派生**，不再硬编码。旧实现写死 "v0.7.0"，
@@ -7150,27 +7150,33 @@ class DshNativePlugin extends Plugin {
      * Origin），通过信任检查；再自行解析 WS 帧（服务端帧未 mask、单文本帧）。
      * 帧解析与重连自控，view 层订阅接口不变。
      * ================================================= */
-    /** 协议探测 → 应用 flavor → 建流。服务上线/重启后重调（服务器可能换代）。 */
+    /** 协议探测 → 铸 cookie → 建流。**返回探测结果**（null = 没拿到协议响应）。
+     *  在途调用复用同一个 promise：旧的 `if (this._detecting) return` 会让并发调用拿到
+     *  undefined 就继续往下跑 —— boot() 正是在探测还没完成时就去调 API，于是在**需要鉴权的
+     *  桌面版**上撞 `workspace.list HTTP 401`（flavor 还是 legacy、走一元 /api/、也没 cookie）。
+     *  2026-10-08 实测：这正是 0.7.7 之后"连上了但仍初始化失败"的根因。 */
     async detectAndConnect() {
-        if (this._detecting) return;
-        this._detecting = true;
-        try {
-            const detected = await detectFlavor(`http://127.0.0.1:${this.activePort || this.settings.port}`, 2500);
-            if (!detected) {
-                // 服务不在线：维持现状（ServiceManager 稍后拉起后会再探测）
-                return;
-            }
-            const changed = this.flavor !== detected.flavor;
-            this.flavor = detected.flavor;
-            this.api.setFlavor(detected.flavor);
-            if (detected.flavor === "v012" && detected.needsAuth) {
-                await this.auth.ensureCookie(`http://127.0.0.1:${this.activePort || this.settings.port}`);
-            }
-            if (changed || !this.wsConnected) this.connectDshWs();
-            console.log(`[dsh-native] 协议代: ${detected.flavor}${detected.needsAuth ? " (auth)" : ""}`);
-        } finally {
-            this._detecting = false;
+        if (this._detectPromise) return this._detectPromise;
+        this._detectPromise = this._detectAndConnectOnce().finally(() => { this._detectPromise = null; });
+        return this._detectPromise;
+    }
+
+    async _detectAndConnectOnce() {
+        const port = this.activePort || this.settings.port;
+        const detected = await detectFlavor(`http://127.0.0.1:${port}`, 2500);
+        if (!detected) {
+            // 服务不在线 / 无协议响应：维持现状，返回 null 让上层判失败（不再静默往下走）
+            return null;
         }
+        const changed = this.flavor !== detected.flavor;
+        this.flavor = detected.flavor;
+        this.api.setFlavor(detected.flavor);
+        if (detected.flavor === "v012" && detected.needsAuth) {
+            await this.auth.ensureCookie(`http://127.0.0.1:${port}`);
+        }
+        if (changed || !this.wsConnected) this.connectDshWs();
+        console.log(`[dsh-native] 协议代: ${detected.flavor}${detected.needsAuth ? " (auth)" : ""}`);
+        return detected;
     }
 
     /** 视图切换会话时跟随（v012 必须显式 follow；legacy 全广播无需处理） */
@@ -7477,8 +7483,21 @@ class DshNativePlugin extends Plugin {
         this.serviceManager.opts = this.getServiceOpts();
         const r = await this.serviceManager.ensureOnline();
         if (r.kind === "online") {
-            // 服务（重新）上线：协议代可能变了（rc.x ↔ 0.1.2+），重探测再接流
-            this.detectAndConnect();
+            // **必须 await**：协议探测 + 铸 cookie 完成后才能让上层调 API。
+            // 不 await 的实测后果＝「workspace.list HTTP 401」：flavor 仍是 legacy、
+            // 请求走一元 /api/workspace.list 且没带 cookie（2026-10-08）。
+            let det = await this.detectAndConnect();
+            if (!det) {
+                // 端口在监听但协议没应答：给一次短重试（服务/App 刚起来时常见）
+                await delay(1200);
+                det = await this.detectAndConnect();
+            }
+            if (!det) {
+                return {
+                    kind: "failed",
+                    message: `127.0.0.1:${this.activePort || this.settings.port} 端口在监听，但没拿到 DSH 协议响应（鉴权失败或版本不匹配）——点面板上的「诊断 DSH」看详情`,
+                };
+            }
         }
         return r;
     }
