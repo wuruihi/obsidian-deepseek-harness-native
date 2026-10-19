@@ -1422,6 +1422,161 @@ select.dsh-chip-btn { max-width: 220px; }
     padding-left: 2px;
 }
 
+/* ============================================================
+ * v0.7.11 批次2：消息级对齐 VSCode（工具组 / 回合分叉线 / 附件 chip /
+ * 图片放大 / 跨会话来源徽标 / 方案审阅样式）
+ * ============================================================ */
+
+/* 同轮连续工具合并行（VSCode ToolGroup：▸ 工具组 · N 步） */
+.dsh-tool-group {
+    margin: 6px 0;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: var(--radius-s);
+    background: var(--background-secondary);
+    overflow: hidden;
+}
+.dsh-tool-group-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-muted);
+    user-select: none;
+}
+.dsh-tool-group-head:hover { background: var(--background-modifier-hover); }
+.dsh-tool-group-tri { font-size: 10px; width: 10px; color: var(--text-faint); }
+.dsh-tool-group-name { color: var(--text-normal); font-weight: 500; }
+.dsh-tool-group-count { color: var(--text-faint); }
+.dsh-tool-group-names {
+    margin-left: auto;
+    max-width: 55%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-faint);
+}
+.dsh-tool-group-body { padding: 0 8px 6px; }
+
+/* 工具活动行：状态图标 / 工具 glyph / 子代理·编辑徽标（对齐 VSCode ActivityCard） */
+.dsh-tool-status {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    border-radius: 50%;
+}
+.dsh-tool-status-done { color: var(--text-success, #2ea043); }
+.dsh-tool-status-failed { color: var(--text-error, #e93147); }
+.dsh-tool-status-running { color: var(--interactive-accent); }
+.dsh-tool-spin {
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid var(--interactive-accent);
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: dsh-spin 0.9s linear infinite;
+}
+@keyframes dsh-spin { to { transform: rotate(360deg); } }
+.dsh-activity-glyph { flex: 0 0 auto; opacity: 0.85; font-size: 11px; }
+.dsh-activity-badge {
+    flex: 0 0 auto;
+    font-size: 9px;
+    line-height: 1;
+    padding: 2px 5px;
+    border-radius: 999px;
+    background: var(--background-modifier-border);
+    color: var(--text-muted);
+}
+.dsh-activity-badge-edit { background: rgba(var(--interactive-accent-rgb), 0.18); color: var(--interactive-accent); }
+
+/* 回合分叉线（VSCode fork-divider：第 N 轮） */
+.dsh-fork-divider { margin: 2px 0 6px; }
+.dsh-fork-divider-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-faint);
+    font-size: 11px;
+}
+.dsh-fork-divider-line::before,
+.dsh-fork-divider-line::after {
+    content: "";
+    flex: 1 1 auto;
+    height: 1px;
+    background: var(--background-modifier-border);
+}
+.dsh-fork-divider-btn {
+    flex: 0 0 auto;
+    border: none;
+    background: none;
+    color: var(--text-faint);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: var(--radius-s);
+}
+.dsh-fork-divider-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+
+/* 用户消息附件 chip（VSCode msg-files / attach-chip） */
+.dsh-msg-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 4px;
+    padding-left: 2px;
+}
+.dsh-attach-chip {
+    font-size: 11px;
+    line-height: 1.4;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--background-secondary);
+    border: 1px solid var(--background-modifier-border);
+    color: var(--text-muted);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dsh-msg-image { cursor: zoom-in; }
+.dsh-msg-image.is-open {
+    max-width: min(100%, 960px) !important;
+    max-height: 70vh !important;
+    cursor: zoom-out;
+}
+
+/* 跨会话审批/提问来源徽标（VSCode SourceBadge） */
+.dsh-pending-source {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin: 2px 0 6px;
+    font-size: 11px;
+    color: var(--interactive-accent);
+    cursor: pointer;
+}
+.dsh-pending-source:hover { text-decoration: underline; }
+
+/* 方案审阅提问（VSCode plan-review intent） */
+.dsh-question-intent {
+    font-size: 11px;
+    color: var(--interactive-accent);
+    margin: 2px 0 4px;
+}
+.dsh-question-plan {
+    max-height: 320px;
+    overflow: auto;
+    border-left: 2px solid var(--background-modifier-border);
+    padding-left: 8px;
+    margin: 4px 0;
+}
+.dsh-question-option.is-approve .dsh-question-option-text { color: var(--text-success, #2ea043); font-weight: 600; }
+
 
 
 

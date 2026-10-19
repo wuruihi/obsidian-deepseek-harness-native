@@ -2931,6 +2931,25 @@ function foldExtractUserPayload(data) {
     if (/^Instructions from\b/.test(firstLine)) return { text: "", files, images };
     return { text: stripSystemContext(raw), files, images };
 }
+/** 同轮连续 tool 段合并为一个工具组（对齐 VSCode ToolGroup：`▸ 工具组 · N 步`）。
+ *  返回 [{kind:"tool",act} | {kind:"toolgroup",acts}]；文本/思考段原样保留并切断分组。 */
+function groupToolSegments(segments) {
+    const out = [];
+    let run = [];
+    const flush = () => {
+        if (!run.length) return;
+        if (run.length === 1) out.push({ kind: "tool", act: run[0] });
+        else out.push({ kind: "toolgroup", acts: run.slice() });
+        run = [];
+    };
+    for (const s of segments || []) {
+        if (s && s.kind === "tool" && s.act) run.push(s.act);
+        else { flush(); out.push(s); }
+    }
+    flush();
+    return out;
+}
+
 /* ==== FOLD-PURE-END ==== */
 
 /* ==== QUESTION-PURE-BEGIN — 用户提问应答编码（回归：node scripts/question-regress.mjs） ====
@@ -4237,7 +4256,6 @@ class DshNativeView extends ItemView {
                 uc.textContent = it.text || ""; // 面板内纯文本渲染（不经主容器/去重管线）
             } else {
                 const bubble = list.createDiv("dsh-msg dsh-msg-assistant");
-                bubble.createDiv("dsh-msg-role").textContent = "DSH";
                 const content = bubble.createDiv("dsh-msg-content");
                 this.renderFoldSegments(content, it);
             }
@@ -4980,15 +4998,12 @@ class DshNativeView extends ItemView {
         return parts;
     }
 
-    buildUserBubbleText(text, attachments) {
-        let s = (text || "").trim();
-        if (attachments && attachments.length) {
-            const names = attachments.map((a) => a.kind === "file" ? ("📄 " + a.file.name)
-                : a.kind === "image" ? ("🖼️ " + (a.part.name || "图片"))
+    /** 附件 → 用户气泡下的 chip 标签（对齐 VSCode msg-files attach-chip）。 */
+    _attachmentChips(attachments) {
+        return (attachments || []).map((a) =>
+            a.kind === "file" ? ("📄 " + a.file.name)
+                : a.kind === "image" ? ("🖼️ " + ((a.part && a.part.name) || "图片"))
                     : ("📝 " + (a.path ? a.path + " 选区" : "选区")));
-            s += (s ? "\n\n" : "") + "📎 " + names.join("、");
-        }
-        return s || "（空消息 + 附件）";
     }
 
     /* @ 文件补全 */
@@ -5276,7 +5291,9 @@ class DshNativeView extends ItemView {
         if (this.assistantEl) {
             this.finalizeAssistant();
         }
-        await this.addUserBubble(this.buildUserBubbleText(text, attachments));
+        const chipLabels = this._attachmentChips(attachments);
+        const imageParts = attachments.filter((a) => a.kind === "image").map((a) => a.part).filter(Boolean);
+        await this.addUserBubble(text || "（空消息）", false, imageParts.length ? imageParts : null, chipLabels.length ? chipLabels : null);
         // 登记已本地发送的用户文本，防止 DSH 经 WS 回推同一 user/message 时重复渲染（Bug 3）
         if (!this._userTextsSent) this._userTextsSent = new Set();
         this._userTextsSent.add(((stripSystemContext(text) || "").replace(/\s+/g, " ").trim()));
@@ -5321,7 +5338,7 @@ class DshNativeView extends ItemView {
         }
     }
 
-    async addUserBubble(text, atTop = false, images = null) {
+    async addUserBubble(text, atTop = false, images = null, files = null) {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-user");
         // 修复 Bug 3：强制可见，避免被父级 flex 容器异常折叠
         bubble.style.display = "flex";
@@ -5346,6 +5363,15 @@ class DshNativeView extends ItemView {
             const pre = content.createEl("pre", { cls: "dsh-msg-fallback" });
             pre.textContent = text;
         }
+        // 附件引用 chip（对齐 VSCode ItemView 的 msg-files / attach-chip：文件标签不塞进正文）
+        if (Array.isArray(files) && files.length) {
+            const chips = bubble.createDiv("dsh-msg-files");
+            for (const f of files) {
+                const chip = chips.createSpan("dsh-attach-chip");
+                chip.textContent = "📎 " + f;
+                chip.setAttribute("title", f);
+            }
+        }
         // v0.4.0 消息内图片（对齐 VSCode MsgImage）：attachmentId → session.attachment 拉字节渲染
         if (Array.isArray(images) && images.length) this._renderUserImages(bubble, images);
         // 渲染完成后再滚到底（仅首屏/实时发送，翻页由 loadHistory 自行控制位置）
@@ -5368,35 +5394,21 @@ class DshNativeView extends ItemView {
         }
         this.assistantEl = this.messagesEl.createDiv("dsh-msg dsh-msg-assistant");
         console.log(`[DSH MSG] beginAssistantBubble CREATE childCount=${this.messagesEl ? this.messagesEl.children.length : '?'}`);
-        const roleEl = this.assistantEl.createDiv("dsh-msg-role");
-        roleEl.textContent = "DSH";
+        // 对齐 VSCode TurnView：不再显示 role 行（气泡本身已表明身份），每条省一行
         this.assistantContent = this.assistantEl.createDiv("dsh-msg-content");
-        // hover 操作条（复制 / 重试 / 分支）—— 对齐 VSCode DSH 每条消息的 hover 操作
+        // hover 操作条：对齐 VSCode TurnActions，只保留「复制」；重试/分叉不再挂每条消息
         const bubble = this.assistantEl;
         const actions = bubble.createDiv("dsh-msg-actions");
-        const copyBtn = actions.createEl("button", { cls: "dsh-mini-btn", attr: { title: "复制助手回答" } });
-        copyBtn.textContent = "复制";
+        const copyBtn = actions.createEl("button", { cls: "dsh-mini-btn", attr: { title: "复制回答" } });
+        copyBtn.textContent = "📋";
         copyBtn.addEventListener("click", () => {
             const txt = (bubble && bubble._md) || this.assistantMd || "";
             if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(txt).then(() => {
                     copyBtn.textContent = "已复制";
-                    setTimeout(() => { copyBtn.textContent = "复制"; }, 1200);
+                    setTimeout(() => { copyBtn.textContent = "📋"; }, 1200);
                 }).catch(() => {});
             }
-        });
-        const retryBtn = actions.createEl("button", { cls: "dsh-mini-btn", attr: { title: "重试：重发上一条用户消息" } });
-        retryBtn.textContent = "重试";
-        retryBtn.addEventListener("click", () => {
-            const t = this.lastUserText;
-            if (t) { this.inputEl.value = t; this.send(); }
-        });
-        const branchBtn = actions.createEl("button", { cls: "dsh-mini-btn", attr: { title: "分支：新会话并重发上一条" } });
-        branchBtn.textContent = "分支";
-        branchBtn.addEventListener("click", async () => {
-            const t = this.lastUserText;
-            await this.newSession();
-            if (t) { this.inputEl.value = t; this.send(); }
         });
         this.assistantMd = "";
         this.thinkingMd = "";
@@ -5480,8 +5492,17 @@ class DshNativeView extends ItemView {
             row.root = this._activityHolder.createDiv("dsh-activity is-active");
             // 头部行（可点击展开）
             row.head = row.root.createDiv("dsh-activity-head");
-            row.icon = row.head.createSpan("dsh-activity-icon"); row.icon.textContent = "⏳";
+            // 对齐 VSCode ActivityCard：状态圈 + 工具分类图标 + 名称（+ 子代理/编辑徽标）
+            row.status = row.head.createSpan("dsh-tool-status dsh-tool-status-running");
+            row.status.createSpan("dsh-tool-spin");
+            row.glyph = row.head.createSpan("dsh-activity-glyph");
+            row.glyph.textContent = this._toolGlyph(data.name || data.toolName);
             row.text = row.head.createSpan("dsh-activity-text"); row.text.textContent = label;
+            if (t === "agent-start" || t === "subagent-start" || t === "agent-end" || t === "subagent-end") {
+                row.head.createSpan("dsh-activity-badge").textContent = "子代理";
+            } else if (this._isEditTool(data.name || data.toolName)) {
+                row.head.createSpan("dsh-activity-badge dsh-activity-badge-edit").textContent = "编辑";
+            }
             row.detail = row.head.createSpan("dsh-activity-detail");
             row.chev = row.head.createSpan("dsh-activity-chev");
             row.chev.textContent = "▸";
@@ -5501,7 +5522,12 @@ class DshNativeView extends ItemView {
             this._activities.set(id, row);
         }
         if (finished && !row.finished) {
-            row.icon.textContent = "✅";
+            if (row.status) {
+                row.status.className = "dsh-tool-status dsh-tool-status-done";
+                row.status.textContent = "✓";
+            } else if (row.icon) {
+                row.icon.textContent = "✅";
+            }
             row.root.removeClass("is-active"); row.root.addClass("is-done");
             row.finished = true;
             try {
@@ -5668,7 +5694,6 @@ class DshNativeView extends ItemView {
     // 历史会话里的单条助手回复（静态，不占用 this.assistantEl）
     renderStaticAssistant(text, thinking, atTop = false) {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-assistant");
-        bubble.createDiv("dsh-msg-role").textContent = "DSH";
         const content = bubble.createDiv("dsh-msg-content");
         this.renderThinkingAndText(content, text, thinking, true);
         if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
@@ -5969,7 +5994,7 @@ class DshNativeView extends ItemView {
         // fromHistory=true：历史是权威源，**必须绕过「本地已发送」文本去重**。
         // 否则同一会话里再次发送同样的文本（例如第二次「你好」）会被前一条历史同文消息
         // 顶掉——2026-10-19 用户报「发完能看到、AI 回复后自己的消息消失」就是这个。
-        if (it.role === "user") this.addUserBubbleFromEvent({ data: { text: it.text, images: it.images } }, atTop, true);
+        if (it.role === "user") this.addUserBubbleFromEvent({ data: { text: it.text, images: it.images, files: it.files } }, atTop, true);
         else this.renderStaticTurn(it.turn, atTop);
     }
 
@@ -5977,7 +6002,14 @@ class DshNativeView extends ItemView {
      *  对齐 VSCode fold v2 —— 不再把工具全抹掉、不会思考正文错位）。 */
     renderStaticTurn(turn, atTop = false) {
         const bubble = this.messagesEl.createDiv("dsh-msg dsh-msg-assistant");
-        bubble.createDiv("dsh-msg-role").textContent = "DSH";
+        // 回合分隔线：对齐 VSCode TurnView 的 fork-divider（「第 N 轮」可从此处分叉）
+        if (turn && turn.ended && turn.turnNo !== undefined && turn.lastSeq !== undefined && this.sessionId) {
+            const divider = bubble.createDiv("dsh-fork-divider");
+            const line = divider.createDiv("dsh-fork-divider-line");
+            const fk = line.createEl("button", { cls: "dsh-fork-divider-btn", attr: { title: "从本轮结束处分叉出新会话" } });
+            fk.textContent = "⑂ 第 " + turn.turnNo + " 轮";
+            fk.addEventListener("click", () => this.forkSessionRowAt(this.sessionId, turn.lastSeq));
+        }
         const content = bubble.createDiv("dsh-msg-content");
         this.renderFoldSegments(content, turn);
         // v0.7.1 失败回合：正文可能是空的，错误块就是这一轮唯一的可见输出
@@ -5986,7 +6018,7 @@ class DshNativeView extends ItemView {
         if (turn && Array.isArray(turn.produced) && turn.produced.length) {
             this.renderProducedCard(bubble, turn.produced);
         }
-        // v0.4.0 TurnActions（对齐 VSCode TurnActions：复制 + 从此处分叉；👍👎 在 VSCode 侧仅日志桩，不搬死按钮）
+        // 对齐 VSCode TurnActions：操作条只保留「复制」；分叉在回合分隔线上
         if (turn && typeof turn.text === "string" && turn.text.trim()) {
             const bar = bubble.createDiv("dsh-msg-actions");
             const cp = bar.createEl("button", { cls: "dsh-msg-action-btn", attr: { title: "复制回答" } });
@@ -5997,11 +6029,6 @@ class DshNativeView extends ItemView {
                     () => new Notice("复制失败"),
                 );
             });
-            if (turn.lastSeq != null) {
-                const fk = bar.createEl("button", { cls: "dsh-msg-action-btn", attr: { title: "从此处分叉出新会话" } });
-                fk.textContent = "⑂";
-                fk.addEventListener("click", () => this.forkSessionRowAt(this.sessionId, turn.lastSeq));
-            }
         }
         if (atTop) this.messagesEl.insertBefore(bubble, this.messagesEl.firstChild);
     }
@@ -6044,8 +6071,11 @@ class DshNativeView extends ItemView {
             await this.renderThinkingAndText(contentEl, (turn && turn.text) || "", (turn && turn.thinking) || "", true);
             return;
         }
-        for (const seg of segs) {
-            if (seg.kind === "tool") {
+        const grouped = groupToolSegments(segs);
+        for (const seg of grouped) {
+            if (seg.kind === "toolgroup") {
+                this.renderToolGroup(contentEl, seg.acts);
+            } else if (seg.kind === "tool") {
                 this.renderFoldActivityRow(ensureHolder(), seg.act);
             } else if (seg.kind === "thinking") {
                 const clean = stripSystemContext(seg.text || "") || "";
@@ -6071,10 +6101,54 @@ class DshNativeView extends ItemView {
         }
     }
 
-    /** 静态活动行（历史回放用；与实时 appendActivity 同一套样式类，默认折叠 args/结果）。 */
-    renderFoldActivityRow(holder, act) {
+    /** 工具名 → 行内图标（对齐 VSCode ActivityCard 的 toolIcon 分类）。 */
+    _toolGlyph(name) {
+        const n = String(name || "").toLowerCase();
+        if (/read|view|cat$/.test(n)) return "👁";
+        if (/edit|write|str-replace|patch/.test(n)) return "✏️";
+        if (/grep|glob|search|find/.test(n)) return "🔍";
+        if (/pwsh|bash|shell|terminal/.test(n)) return "💻";
+        if (/todo|task/.test(n)) return "☑";
+        if (/web|fetch|browser/.test(n)) return "🌐";
+        if (/subagent|agent|workflow|ralph/.test(n)) return "👥";
+        if (/skill/.test(n)) return "🧩";
+        if (/goal|plan/.test(n)) return "🎯";
+        if (/diff/.test(n)) return "📑";
+        return "🔧";
+    }
+
+    _isEditTool(name) {
+        const n = String(name || "").toLowerCase();
+        return n === "edit" || n === "str-replace-editor" || n === "write" || n.includes("edit") || n.includes("write");
+    }
+
+    /** 同轮连续工具合并行（对齐 VSCode ToolGroup：`▸ 工具组 · N 步`）。 */
+    renderToolGroup(contentEl, acts) {
+        if (!Array.isArray(acts) || acts.length === 0) return;
+        const uniq = [...new Set(acts.map((a) => a.name || a.label).filter(Boolean))];
+        const running = acts.some((a) => a.state === "running");
+        const wrap = contentEl.createDiv("dsh-tool-group");
+        const head = wrap.createDiv("dsh-tool-group-head");
+        head.createSpan("dsh-tool-group-tri").textContent = "▸";
+        head.createSpan("dsh-tool-group-name").textContent = "工具组";
+        head.createSpan("dsh-tool-group-count").textContent = " · " + acts.length + " 步" + (running ? " · 进行中" : "");
+        head.createSpan("dsh-tool-group-names").textContent = uniq.slice(0, 3).join(" · ");
+        const body = wrap.createDiv("dsh-tool-group-body");
+        body.style.display = "none";
+        for (const act of acts) this.renderFoldActivityRow(body, act, 999);
+        let open = false;
+        head.addEventListener("click", () => {
+            open = !open;
+            body.style.display = open ? "" : "none";
+            head.querySelector(".dsh-tool-group-tri").textContent = open ? "▾" : "▸";
+        });
+    }
+
+    /** 静态活动行（历史回放用；与实时 appendActivity 同一套样式类，默认折叠 args/结果）。
+     *  maxRows 默认 5（超出折叠成「更多活动」）；工具组内部传大值不截断。 */
+    renderFoldActivityRow(holder, act, maxRows = 5) {
         if (!act) return;
-        const MAX = 5;
+        const MAX = maxRows;
         if (holder.childElementCount >= MAX) {
             let summary = holder.querySelector(".dsh-activity-overflow");
             if (!summary) {
@@ -6090,11 +6164,17 @@ class DshNativeView extends ItemView {
         }
         const row = holder.createDiv(`dsh-activity ${act.state === "running" ? "is-active" : act.state === "error" ? "is-error" : "is-done"}`);
         const head = row.createDiv("dsh-activity-head");
-        head.createSpan("dsh-activity-icon").textContent = act.state === "error" ? "❌" : act.state === "running" ? "⏳" : act.kind === "step" ? "📍" : "✅";
+        // 状态：运行中转圈 / 完成勾 / 失败叉（对齐 VSCode tool-status）
+        const status = head.createSpan("dsh-tool-status dsh-tool-status-" + (act.state === "error" ? "failed" : act.state === "running" ? "running" : "done"));
+        if (act.state === "running") status.createSpan("dsh-tool-spin");
+        else status.textContent = act.state === "error" ? "✕" : "✓";
+        head.createSpan("dsh-activity-glyph").textContent = this._toolGlyph(act.name);
         head.createSpan("dsh-activity-text").textContent = act.label;
+        if (act.kind === "subagent") head.createSpan("dsh-activity-badge").textContent = "子代理";
+        if (this._isEditTool(act.name)) head.createSpan("dsh-activity-badge dsh-activity-badge-edit").textContent = "编辑";
         const detail = head.createSpan("dsh-activity-detail");
         const prev = act.resultPreview || act.detail || "";
-        if (prev) detail.textContent = " — " + String(prev).replace(/\s+/g, " ").slice(0, 200);
+        if (prev) detail.textContent = " — " + String(prev).replace(/\s+/g, " ").slice(0, 80);
         const argsStr = act.args != null ? (typeof act.args === "string" ? act.args : (() => { try { return JSON.stringify(act.args, null, 2); } catch (_e) { return ""; } })()) : "";
         if (argsStr || act.resultPreview) {
             const body = row.createDiv("dsh-activity-body");
@@ -6178,23 +6258,30 @@ class DshNativeView extends ItemView {
             }
         }
         console.log(`[DSH MSG] fromEvent ADD atTop=${atTop} key=${JSON.stringify(key.slice(0,50))} childCount=${this.messagesEl ? this.messagesEl.children.length : '?'}`);
-        this.addUserBubble(cleaned, atTop, Array.isArray(d.images) && d.images.length ? d.images : null);
+        this.addUserBubble(cleaned, atTop, Array.isArray(d.images) && d.images.length ? d.images : null,
+            Array.isArray(d.files) && d.files.length ? d.files : null);
     }
 
-    // v0.4.0 用户消息图片渲染：attachmentId → dataUrl（带进程内缓存，失败降级占位）
+    // v0.4.0 用户消息图片渲染：attachmentId → dataUrl（带进程内缓存，失败降级占位）。
+    // v0.7.11 对齐 VSCode MsgImage：支持 inline dataUrl、点击放大/还原。
     _renderUserImages(bubble, images) {
         if (!this._attachCache) this._attachCache = new Map();
         const box = bubble.createDiv("dsh-msg-images");
         for (const img of images) {
-            const id = img && img.attachmentId;
-            if (!id) continue;
-            const el = box.createEl("img", { cls: "dsh-msg-image", attr: { alt: img.name || "图片", loading: "lazy" } });
+            const ref = (img && img.attachment) || {};
+            const id = (img && img.attachmentId) || ref.attachmentId;
+            const dataUrl = img && typeof img.dataUrl === "string" ? img.dataUrl : undefined;
+            if (!id && !dataUrl) continue;
+            const name = (img && img.name) || ref.name || "图片";
+            const el = box.createEl("img", { cls: "dsh-msg-image", attr: { alt: name, title: name, loading: "lazy" } });
+            el.addEventListener("click", () => el.classList.toggle("is-open"));
+            if (dataUrl) { el.src = dataUrl; continue; }
             const cached = this._attachCache.get(id);
             if (cached) { el.src = cached; continue; }
             el.addClass("is-loading");
             const sid = this.sessionId;
             this.api.getAttachment(sid, id).then((v) => {
-                const mediaType = (v && v.attachment && v.attachment.mediaType) || img.mediaType || "image/png";
+                const mediaType = (v && v.attachment && v.attachment.mediaType) || (img && img.mediaType) || ref.mediaType || "image/png";
                 const data = v && typeof v.data === "string" ? v.data : "";
                 if (!data) throw new Error("empty attachment data");
                 const url = `data:${mediaType};base64,${data}`;
@@ -6754,13 +6841,13 @@ class DshNativeView extends ItemView {
                 extra[k] = typeof v === "object" ? JSON.stringify(v) : String(v);
             }
         }
-        this.pending.set(key, { kind: "approval", rpcId: rpcIdValue, toolName: payload.toolName, reason: payload.reason, extra });
+        this.pending.set(key, { kind: "approval", rpcId: rpcIdValue, sessionId: payload.sessionId, toolName: payload.toolName, reason: payload.reason, extra });
         this.renderPendingCards();
     }
 
     handleQuestion(payload, rpcIdValue) {
         const key = "q:" + rpcIdValue;
-        this.pending.set(key, { kind: "question", rpcId: rpcIdValue, questions: payload.questions });
+        this.pending.set(key, { kind: "question", rpcId: rpcIdValue, sessionId: payload.sessionId, questions: payload.questions });
         this.renderPendingCards();
     }
 
@@ -6773,6 +6860,15 @@ class DshNativeView extends ItemView {
         this.messagesEl.querySelectorAll(".dsh-pending").forEach((n) => n.remove());
         for (const [key, entry] of this.pending) {
             const card = this.messagesEl.createDiv("dsh-msg dsh-pending");
+            // 跨会话卡片来源徽标（对齐 VSCode cards.tsx SourceBadge）：别的会话弹的审批/提问
+            // 也要能在当前面板答，但必须标明来源并可一键跳过去。
+            if (entry.sessionId && this.sessionId && entry.sessionId !== this.sessionId) {
+                const row = (this.sessions || []).find((s) => s.sessionId === entry.sessionId);
+                const title = row ? (this._resolveTitle(row) || row.title || entry.sessionId.slice(0, 8)) : entry.sessionId.slice(0, 8);
+                const badge = card.createDiv("dsh-pending-source");
+                badge.textContent = "🔔 来自会话《" + title + "》 · 切换 →";
+                badge.addEventListener("click", () => this.switchSession(entry.sessionId));
+            }
             if (entry.kind === "approval") {
                 const titleEl = card.createDiv("dsh-pending-title");
                 titleEl.textContent = "🔐 需要审批：" + (entry.toolName || "");
@@ -6794,7 +6890,8 @@ class DshNativeView extends ItemView {
                 const allowBtn = actions.createEl("button", { cls: "dsh-btn mod-cta" });
                 allowBtn.textContent = "允许一次";
                 allowBtn.addEventListener("click", () => {
-                    this.answerApproval(key, "allowed");
+                    // DSH 契约 outcome 枚举是 "allowed-once"（不是 "allowed"；发错会被拒）
+                    this.answerApproval(key, "allowed-once");
                 });
                 const denyBtn = actions.createEl("button", { cls: "dsh-btn" });
                 denyBtn.textContent = "拒绝";
@@ -6814,16 +6911,23 @@ class DshNativeView extends ItemView {
                     // 服务端字段是 multiSelect；multi 是 legacy 客户端叫法
                     const multi = qObj.multiSelect === true || qObj.multi === true;
                     const opts = Array.isArray(qObj.options) ? qObj.options : [];
+                    const plan = qObj.intent && qObj.intent.kind === "plan-review" ? qObj.intent : null;
                     const qWrap = card.createDiv("dsh-question-item");
                     if (qObj.header) qWrap.createDiv("dsh-question-header").textContent = String(qObj.header);
+                    if (plan) qWrap.createDiv("dsh-question-intent").textContent = "📋 方案审阅 — 下方计划需你批准后才会执行";
                     qWrap.createDiv("dsh-question-label").textContent = (qi + 1) + ". " + qText;
-                    if (qObj.detail) qWrap.createDiv("dsh-question-detail").textContent = String(qObj.detail);
+                    if (qObj.detail) {
+                        const detailEl = qWrap.createDiv(plan ? "dsh-question-detail dsh-question-plan" : "dsh-question-detail");
+                        if (plan) void MarkdownRenderer.render(this.app, String(qObj.detail), detailEl, "", this);
+                        else detailEl.textContent = String(qObj.detail);
+                    }
                     if (opts.length) {
                         const optGroup = qWrap.createDiv("dsh-question-options");
                         opts.forEach((opt) => {
                             const o = typeof opt === "string" ? { label: opt } : (opt || {});
                             const optLabel = o.label || o.value || String(opt);
-                            const row = optGroup.createDiv("dsh-question-option");
+                            const isApprove = !!(plan && plan.approve && optLabel === plan.approve);
+                            const row = optGroup.createDiv("dsh-question-option" + (isApprove ? " is-approve" : ""));
                             const cb = row.createEl("input", {
                                 attr: { type: multi ? "checkbox" : "radio", name: "q" + qi, value: optLabel }
                             });
@@ -6840,7 +6944,7 @@ class DshNativeView extends ItemView {
                                 }
                             });
                             const span = row.createSpan("dsh-question-option-text");
-                            span.textContent = optLabel;
+                            span.textContent = (isApprove ? "✓ " : "") + optLabel;
                             span.addEventListener("click", () => { cb.click(); });
                             if (o.description) {
                                 const desc = row.createDiv("dsh-question-option-desc");

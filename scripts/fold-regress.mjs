@@ -16,7 +16,7 @@ if (!foldBlock || !stripBlock) {
 const ns = new Function(`
     ${stripBlock[0]}
     ${foldBlock[0]}
-    return { DshFold, foldResultCallId, foldExtractUserPayload, foldLatestTurn, foldAssistantParts };
+    return { DshFold, foldResultCallId, foldExtractUserPayload, foldLatestTurn, foldAssistantParts, groupToolSegments };
 `)();
 const { DshFold, foldResultCallId } = ns;
 
@@ -423,6 +423,24 @@ const check = (name, ok, detail = "") => {
     check("重复发送同一文本保留两条用户消息（历史渲染不得按文本去重）", users.length === 2 && users.every((u) => u.text === "你好"), `users=${users.length}`);
     const kinds = f.items.map((i) => i.kind).join(",");
     check("用户消息都排在自己那轮助手回复之前（U,A,U,A）", kinds === "user,turn,user,turn", kinds);
+}
+
+// 23. 工具段分组（v0.7.11 对齐 VSCode ToolGroup）：连续工具合组、文本/思考切断分组
+{
+    const segs = [
+        { kind: "text", text: "先看" },
+        { kind: "tool", act: { key: "c1", name: "read", label: "read a" } },
+        { kind: "tool", act: { key: "c2", name: "grep", label: "grep b" } },
+        { kind: "thinking", text: "想一想" },
+        { kind: "tool", act: { key: "c3", name: "write", label: "write c" } },
+        { kind: "tool", act: { key: "c4", name: "bash", label: "bash d" } },
+        { kind: "tool", act: { key: "c5", name: "bash", label: "bash e" } },
+    ];
+    const g = ns.groupToolSegments(segs);
+    const shape = g.map((s) => s.kind === "toolgroup" ? "group(" + s.acts.length + ")" : s.kind).join(",");
+    check("连续工具合并成组、文本/思考切断分组", shape === "text,group(2),thinking,group(3)", shape);
+    check("单工具保持独立活动行（不成组）", g[0].kind === "text" && g[1].kind === "toolgroup" && g[1].acts.length === 2);
+    check("分组不丢工具顺序", g[1].acts.map((a) => a.key).join(",") === "c1,c2" && g[3].acts.map((a) => a.key).join(",") === "c3,c4,c5");
 }
 
 console.log(`\n${pass}/${pass + fail} passed`);
