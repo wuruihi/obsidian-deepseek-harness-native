@@ -70,8 +70,8 @@ const LEGACY_STARTUP_COMMANDS = [
 const DEFAULT_SETTINGS = {
     port: 3080,
     // v0.7.7（对齐 dsh-vscode §3.5）：连哪个 DSH 实例。
-    //   "auto"    自动——优先探测**桌面版 App（19387）**，其次旧版 dsh web（port）
-    //   "desktop" 只连桌面版 App（19387，硬编码端口）
+    //   "auto"    自动——运行时发现桌面版 App 端口（0.2.1+ 每次启动都变），其次旧版 dsh web（port）
+    //   "desktop" 只连桌面版 App（端口运行时发现；≤0.2.0 兼容端口 19387）
     //   "legacy"  只连旧版 dsh web（端口见 port）
     // 老配置迁移见 loadSettings：没写过 instance 且 port 是默认 3080 ⇒ auto（旧默认=没表态）；
     // 自定义端口 ⇒ legacy（尊重用户的显式设置，绝不被原型探测悄悄改掉）。
@@ -423,7 +423,7 @@ class ServiceManager {
         // 那正是 2026-10-08 用户被误导的原因（插件在找已经不存在的旧 CLI）。
         if (this.opts.instanceKind === "desktop") {
             const exe = desktopAppExe();
-            return "桌面版 App（127.0.0.1:" + this.opts.port + "）没在运行" +
+            return "桌面版 App 没在运行（端口每次启动自动发现）" +
                 (exe ? "；可在插件设置里点「打开桌面版 App」，或直接用桌面图标启动它"
                      : "；也没找到桌面版安装（%LOCALAPPDATA%\\Programs\\DeepSeek Harness）");
         }
@@ -435,22 +435,10 @@ class ServiceManager {
     async ensureOnline() {
         if (await this.probe()) return { kind: "online" };
         // 桌面版实例：**不由插件拉起**（不跑旧版启动命令、更不 kill 它的端口），
-        // 只按开关帮忙打开 App，然后等它就绪。
+        // 也不在这里等固定端口——0.2.1 起端口每次启动都变，由插件上层
+        // ensureServiceOnline() 打开 App 后**重新发现**端口再探活（见 waitForDesktopInstance）。
         if (this.opts.instanceKind === "desktop") {
-            const waitMs = Math.min(this.opts.readyTimeoutMs || 60000, 60000);
-            if (this.opts.autoOpenDesktop && this.opts.openDesktop) {
-                const launched = await this.opts.openDesktop();
-                if (launched) {
-                    const deadline = Date.now() + waitMs;
-                    while (Date.now() < deadline) {
-                        if (this.disposed) return { kind: "failed", message: "插件已卸载" };
-                        await delay(1000);
-                        if (await this.probe()) return { kind: "online" };
-                    }
-                    return { kind: "failed", message: `已尝试打开桌面版 App，但 ${Math.ceil(waitMs / 1000)}s 内没有就绪` };
-                }
-            }
-            return { kind: "failed", message: this.describeOffline() };
+            return { kind: "failed", message: this.describeOffline() + "（端口由插件运行时自动发现）" };
         }
         if (!this.opts.autoStart) return { kind: "failed", message: this.describeOffline() };
         this.start();
@@ -3048,32 +3036,51 @@ function permissionIdOf(p) {
 /* ==== INSTANCE-PURE-BEGIN — 该连哪个 DSH 实例（回归：node scripts/instance-regress.mjs） ====
    背景（2026-10-08 用户报「连不上」）：插件原来只有一个「服务端口」，默认 3080 —— 那是
    **旧 CLI（dsh web）**的端口。用户 2026-09-30 删掉旧 CLI 后 3080 再没有服务，而
-   **桌面版 App（19387）**一直活着（需要鉴权，插件的 v012 鉴权链本来就支持）。
-   对齐 dsh-vscode §3.5 的实例选择：**显式配置优先，否则探测桌面版 19387 → 旧版 3080**，
-   谁应答连谁；桌面版实例由 App 自己管理——插件**不拉起、不 kill 它的端口**（只能提示或帮忙打开 App）。
+   **桌面版 App**一直活着（需要鉴权，插件的 v012 鉴权链本来就支持）。
 
-   纯函数只做"决策"：给定配置 + 各候选的探活结果，返回该连谁；探活由 resolveInstance() 做。 */
-const DESKTOP_APP_PORT = 19387; // 桌面版 App 的硬编码端口（不可配置，App 固定监听它）
-const LEGACY_WEB_PORT = 3080;   // 旧 CLI `dsh web` 的默认端口（可配置）
+   2026-10-19（DSH 0.2.1）：桌面版宿主改用 `--port 0`，端口由系统分配、**每次启动都变**
+   （官方 release note v0.2.1-alpha.1：避免 Windows 保留端口范围导致应用起不来）⇒
+   19387 只对 ≤0.2.0 成立。所以桌面版候选改为**运行时发现**（`discoverDesktopPorts`），
+   19387 仅作兼容候选；显式配置仍最高优先（对齐 dsh-vscode §3.5）。
+
+   纯函数只做"决策"：给定配置 + 已发现端口 + 各候选探活结果，返回该连谁。 */
+const LEGACY_DESKTOP_PORT = 19387; // ≤0.2.0 桌面版固定端口（0.2.1+ 由系统分配）
+const LEGACY_WEB_PORT = 3080;      // 旧 CLI `dsh web` 的默认端口（可配置）
 const INSTANCE_MODES = ["auto", "desktop", "legacy"];
 
+/** 桌面版候选：优先用发现到的端口（升序）；一个都没发现时退回兼容端口 19387，
+ *  让上层能给出"打开桌面版 App"的指引。 */
+function desktopCandidates(desktopPorts) {
+    const ports = (Array.isArray(desktopPorts) ? desktopPorts : [])
+        .map((p) => Number(p))
+        .filter((p) => Number.isInteger(p) && p > 0 && p <= 65535);
+    const uniq = [...new Set(ports)].sort((a, b) => a - b);
+    const list = uniq.length ? uniq : [LEGACY_DESKTOP_PORT];
+    return list.map((port) => ({
+        kind: "desktop",
+        port,
+        label: "桌面版 App（127.0.0.1:" + port + (uniq.length ? "，自动发现" : "，兼容端口") + "）",
+    }));
+}
+
 /** 候选实例（按探测顺序）。settings.instance 非法/缺失一律按 auto（宽松校验）。 */
-function instanceCandidates(settings) {
+function instanceCandidates(settings, desktopPorts) {
     const st = settings || {};
     const mode = INSTANCE_MODES.includes(st.instance) ? st.instance : "auto";
     const legacyPort = Number(st.port) > 0 ? Number(st.port) : LEGACY_WEB_PORT;
-    const desktop = { kind: "desktop", port: DESKTOP_APP_PORT, label: "桌面版 App（127.0.0.1:" + DESKTOP_APP_PORT + "）" };
     const legacy = { kind: "legacy", port: legacyPort, label: "旧版 dsh web（127.0.0.1:" + legacyPort + "）" };
-    if (mode === "desktop") return [desktop];
+    const desktops = desktopCandidates(desktopPorts);
+    if (mode === "desktop") return desktops;
     if (mode === "legacy") return [legacy];
-    // auto：桌面版优先（它是常驻实例）；旧版端口恰好相同则不重复探测
-    return legacyPort === DESKTOP_APP_PORT ? [desktop] : [desktop, legacy];
+    // auto：桌面版优先（它是常驻实例）；同端口去重时桌面版优先
+    const all = [...desktops, legacy];
+    return all.filter((c, i) => all.findIndex((x) => x.port === c.port) === i);
 }
 
 /** 决策：alive 是 { [port]: boolean } 探活表。全不通时返回**首选**并标 alive:false ——
  *  让上层给出"打开桌面版 App"的指引，而不是去跑旧版启动命令（那是这次故障误导的来源）。 */
-function pickInstance(settings, alive) {
-    const cands = instanceCandidates(settings);
+function pickInstance(settings, alive, desktopPorts) {
+    const cands = instanceCandidates(settings, desktopPorts);
     const ok = alive || {};
     for (const c of cands) if (ok[c.port]) return Object.assign({}, c, { alive: true });
     return Object.assign({}, cands[0], { alive: false });
@@ -3093,16 +3100,133 @@ function desktopAppExe() {
     return "";
 }
 
-/** 探活并决定该连哪个实例（每个候选 800ms TCP 探测；显式配置只探一个）。
- *  返回 {kind, port, label, alive, probed:[{kind,port,label,alive}]}。 */
+/* ==== DESKTOP-DISCOVERY-BEGIN — 桌面版端口运行时发现（DSH 0.2.1+；工具：scripts/which-port.mjs） ====
+   桌面版宿主 0.2.1 起用 `--port 0`，端口由系统分配且**不落盘**（全盘无端口文件），所以只能问
+   Windows「桌面版进程开着哪些监听端口」：
+
+   - 快路径（实测 ~0.2s，不依赖 PowerShell）：`tasklist /FI "IMAGENAME eq DeepSeek Harness.exe"`
+     取 PID → `netstat -ano -p tcp` 里匹配「本地地址末段端口 + 对端通配 0.0.0.0:0/[::]:0 + 末列
+     PID ∈ 集合」。端口/对端/PID 都是纯 ASCII，按行锚定解析，不吃系统语言。
+   - 兜底（上限 3s）：快路径看到进程却没拿到端口时用 PowerShell `Get-NetTCPConnection`
+     （含按安装目录找 `node.exe` 宿主）；`NO_NETTCPIP` / `DISCOVERY_ERROR` 哨兵让失败可见，
+     不再"没发现端口"与"App 没开"混为一谈。
+   - 只取桌面版进程自己的监听，**不扫全端口**；任何失败都返回 [] 并写下 lastDiscoveryNote()，
+     上层退回固定候选（19387/3080），不会把插件卡死。 */
+const DISCOVERY_MAX_PORTS = 8;
+const DISCOVERY_TIMEOUT_MS = 3000;
+let _discoveryNote = "";
+
+function lastDiscoveryNote() {
+    return _discoveryNote;
+}
+
+function runCapture(file, args, timeoutMs) {
+    return new Promise((resolve) => {
+        child_process.execFile(
+            file,
+            args,
+            { windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+            (err, stdout) => resolve({ err: err || null, stdout: typeof stdout === "string" ? stdout : "" }),
+        );
+    });
+}
+
+async function discoverDesktopPortsFast() {
+    const list = await runCapture("tasklist", ["/FI", "IMAGENAME eq DeepSeek Harness.exe", "/FO", "CSV", "/NH"], 2500);
+    const pids = new Set();
+    for (const m of list.stdout.matchAll(/"([^"]+)","(\d+)"/g)) pids.add(Number(m[2]));
+    if (pids.size === 0) return { ports: [], sawProcess: false };
+    const net = await runCapture("netstat", ["-ano", "-p", "tcp"], 2500);
+    const ports = new Set();
+    for (const line of net.stdout.split(/\r?\n/)) {
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 5 || cols[0].toUpperCase() !== "TCP") continue;
+        const pid = Number(cols[cols.length - 1]);
+        if (!pids.has(pid)) continue;
+        if (!/^(0\.0\.0\.0:0|\[::\]:0)$/.test(cols[2])) continue; // 只听监听态（对端通配）
+        const m = /:(\d+)$/.exec(cols[1]);
+        if (!m) continue;
+        const port = Number(m[1]);
+        if (port > 0 && port <= 65535) ports.add(port);
+    }
+    return { ports: [...ports].sort((a, b) => a - b), sawProcess: true };
+}
+
+async function discoverDesktopPortsViaPowerShell(appPath) {
+    const installDir = appPath
+        ? path.dirname(appPath)
+        : path.join(process.env.LOCALAPPDATA || "", "Programs", "DeepSeek Harness");
+    const escapedDir = installDir.replace(/'/g, "''");
+    const script =
+        "try { " +
+        "if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) { 'NO_NETTCPIP' } else { " +
+        "$ids = @(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); " +
+        "$ports = @(); " +
+        "if ($ids.Count -gt 0) { $ports = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $ids -contains $_.OwningProcess } | Select-Object -ExpandProperty LocalPort) }; " +
+        "if (($ports.Count -eq 0) -and ($ids.Count -gt 0)) { " +
+        "$dir = '" + escapedDir + "'; " +
+        "$more = @(Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+        "Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) } | " +
+        "Select-Object -ExpandProperty ProcessId); " +
+        "if ($more) { $ports = @(Get-NetTCPConnection -State Listen | Where-Object { $more -contains $_.OwningProcess } | Select-Object -ExpandProperty LocalPort) } " +
+        "}; " +
+        "$ports | Sort-Object -Unique } } catch { 'DISCOVERY_ERROR' }";
+    const res = await runCapture("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], DISCOVERY_TIMEOUT_MS);
+    if (res.err) {
+        _discoveryNote = "端口自动发现失败（PowerShell 不可用或被策略禁止）";
+        return [];
+    }
+    if (res.stdout.includes("NO_NETTCPIP")) {
+        _discoveryNote = "端口自动发现不可用（系统缺少 NetTCPIP 模块）";
+        return [];
+    }
+    if (res.stdout.includes("DISCOVERY_ERROR")) {
+        _discoveryNote = "端口自动发现失败（PowerShell 执行出错）";
+        return [];
+    }
+    return [...new Set(res.stdout.split(/\r?\n/).map((s) => s.trim()).filter((s) => /^\d+$/.test(s)).map(Number))]
+        .filter((port) => port > 0 && port <= 65535)
+        .sort((a, b) => a - b)
+        .slice(0, DISCOVERY_MAX_PORTS);
+}
+
+/** 返回桌面版 App 当前监听的端口（Windows；失败返回 []）。 */
+async function discoverDesktopPorts(appPath) {
+    if (process.platform !== "win32") return [];
+    try {
+        const fast = await discoverDesktopPortsFast();
+        if (fast.ports.length > 0) {
+            _discoveryNote = "";
+            return fast.ports.slice(0, DISCOVERY_MAX_PORTS);
+        }
+        // 没有桌面版进程 ⇒ 无需兜底（省掉 ~2s 的 PowerShell）
+        if (!fast.sawProcess) return [];
+        const slow = await discoverDesktopPortsViaPowerShell(appPath);
+        if (slow.length > 0) _discoveryNote = "";
+        return slow;
+    } catch (e) {
+        _discoveryNote = "端口自动发现失败：" + (e && e.message ? e.message : String(e));
+        return [];
+    }
+}
+/* ==== DESKTOP-DISCOVERY-END ==== */
+
+/** 探活并决定该连哪个实例：先发现桌面版端口（0.2.1+ 动态），再按候选顺序做 TCP 探活。
+ *  返回 {kind, port, label, alive, discovered, probed:[{kind,port,label,alive}]}。
+ *  显式配置（desktop/legacy）仍最高优先，只是 desktop 的端口不再是字面量。 */
 async function resolveInstance(settings) {
-    const cands = instanceCandidates(settings);
+    let discovered = [];
+    try { discovered = await discoverDesktopPorts(desktopAppExe()); } catch (_e) { discovered = []; }
+    const cands = instanceCandidates(settings, discovered);
     const alive = {};
     for (const c of cands) {
         try { alive[c.port] = await tcpProbe(c.port, 800); } catch (_e) { alive[c.port] = false; }
     }
-    const picked = pickInstance(settings, alive);
-    return Object.assign({}, picked, { probed: cands.map((c) => Object.assign({}, c, { alive: !!alive[c.port] })) });
+    const picked = pickInstance(settings, alive, discovered);
+    return Object.assign({}, picked, {
+        discovered,
+        probed: cands.map((c) => Object.assign({}, c, { alive: !!alive[c.port] })),
+    });
 }
 
 /* ==== STATS-PURE-BEGIN — 底栏 token 口径（回归：node scripts/stats-regress.mjs） ====
@@ -3609,13 +3733,16 @@ class DshNativeView extends ItemView {
 
     async diagnose() {
         // 用 requestUrl 直接打 DSH 根 URL + /api/workspace.list 双重验证，把结果写到 overlay。
-        // v0.7.7：先把**两个候选实例**都列出来（桌面版 19387 / 旧版 3080），再报选中的那个 ——
-        // 旧版只报一个端口，用户看到"3080 不通"时根本不知道机器上其实有活着的桌面版。
+        // v0.7.7：先把候选实例都列出来，再报选中的那个。
+        // v0.7.9：桌面版端口改为运行时发现（0.2.1+），所以先报"发现了哪些端口"再报探活。
         const lines = [];
         const pings = await this.plugin.ensureServiceOnline();
         const port = this.plugin.activePort || this.plugin.settings.port;
         const kind = this.plugin.activeKind || "legacy";
         const probed = this.plugin.instanceProbe || [];
+        const discovered = this.plugin.discoveredPorts || [];
+        lines.push("• 桌面版端口自动发现：" + (discovered.length ? discovered.join(", ") + " ✅" : "未发现（App 没起，或发现被策略禁止）") +
+            (lastDiscoveryNote() ? " — " + lastDiscoveryNote() : ""));
         if (probed.length) {
             lines.push("• 候选实例探活：" + probed.map((p) => `${p.kind === "desktop" ? "桌面版" : "旧版"} ${p.port} ${p.alive ? "✅" : "❌"}`).join("　"));
         }
@@ -6868,15 +6995,20 @@ class DshNativeSettingTab extends PluginSettingTab {
         this._dshStatusEl.style.fontFamily = "var(--font-monospace,monospace)";
         this._dshStatus(detectDsh(), defaultInstallDir);
 
-        // 2) 连哪个 DSH 实例（v0.7.7，对齐 VSCode §3.5）
+        // 2) 连哪个 DSH 实例（v0.7.7，对齐 VSCode §3.5；v0.7.9 端口改运行时发现）
         //    背景：旧默认是「端口 3080」＝旧 CLI，而旧 CLI 已于 2026-09-30 删除 ⇒ 必须能指到桌面版 App。
+        //    2026-10-19：DSH 0.2.1 起桌面版端口由系统分配、每次启动都变（--port 0），不再有固定 19387。
+        const discoveredPorts = this.plugin.discoveredPorts || [];
         new Setting(containerEl)
             .setName("连接的 DSH 实例")
-            .setDesc("自动＝优先附身桌面版 App（127.0.0.1:19387），没起再试旧版 dsh web；两者都只连不接管桌面版。")
+            .setDesc(
+                "自动＝运行时发现桌面版 App 的本地端口（DSH 0.2.1 起端口每次启动都变），没起再试旧版 dsh web；两者都只连不接管桌面版。" +
+                (discoveredPorts.length ? " 当前发现：" + discoveredPorts.join(", ") : " 当前未发现桌面版端口。"),
+            )
             .addDropdown((d) =>
                 d
                     .addOption("auto", "自动（优先桌面版 App）")
-                    .addOption("desktop", "桌面版 App（19387）")
+                    .addOption("desktop", "桌面版 App（端口自动发现）")
                     .addOption("legacy", "旧版 dsh web（自定义端口）")
                     .setValue(this.plugin.settings.instance || "auto")
                     .onChange(async (v) => {
@@ -7437,18 +7569,39 @@ class DshNativePlugin extends Plugin {
         };
     }
 
-    /** 探活并选定实例（对齐 dsh-vscode §3.5）：显式配置优先，否则桌面版 19387 → 旧版 3080。
-     *  结果写进 activePort/activeKind，并同步 api.baseUrl —— 此后所有连接（REST/WS/浏览器）
-     *  都用 activePort，不再直接读 settings.port。 */
+    /** 探活并选定实例：显式配置优先；桌面版端口运行时发现（0.2.1+），19387 仅兼容。
+     *  结果写进 activePort/activeKind，并同步 api.baseUrl / serviceManager —— 此后所有连接
+     *  （REST/WS/浏览器/重启）都用 activePort，不再直接读 settings.port。 */
     async resolveActiveInstance() {
         const picked = await resolveInstance(this.settings);
+        this.applyInstance(picked);
+        return picked;
+    }
+
+    /** 把一次 resolve 结果落成"当前实例"（resolve/wait/重启共用）。 */
+    applyInstance(picked) {
         this.activePort = picked.port;
         this.activeKind = picked.kind;
-        this.instanceProbe = picked.probed;
+        this.instanceProbe = picked.probed || [];
+        this.discoveredPorts = picked.discovered || [];
         this.api.baseUrl = `http://127.0.0.1:${picked.port}`;
+        this.serviceManager.opts = this.getServiceOpts();
         console.log("[dsh-native] instance:", picked.kind, "port", picked.port, picked.alive ? "(alive)" : "(offline)",
+            "discovered:", (picked.discovered || []).join(",") || "none",
             "probed:", (picked.probed || []).map((p) => `${p.port}:${p.alive ? "up" : "down"}`).join(" "));
-        return picked;
+    }
+
+    /** 桌面版 App 打开后等"发现到端口 + TCP 通"（0.2.1 起端口每次启动都变，不能等固定端口）。
+     *  返回最后一次 apply 过的 picked；超时返回 null。 */
+    async waitForDesktopInstance(timeoutMs) {
+        const waitMs = timeoutMs || Math.min(this.settings.readyTimeoutMs || 60000, 120000);
+        const deadline = Date.now() + waitMs;
+        while (Date.now() < deadline) {
+            const picked = await this.resolveActiveInstance();
+            if (picked.alive) return picked;
+            await delay(1000);
+        }
+        return null;
     }
 
     /** 打开桌面版 App（插件不启动/不 kill 它，只帮忙拉起）。返回是否成功发起。 */
@@ -7478,28 +7631,49 @@ class DshNativePlugin extends Plugin {
     }
 
     async ensureServiceOnline() {
-        // 先定实例（探活 + 选定），再谈"在不在线"——否则会在错误的端口上等 120s
-        await this.resolveActiveInstance();
-        this.serviceManager.opts = this.getServiceOpts();
-        const r = await this.serviceManager.ensureOnline();
-        if (r.kind === "online") {
-            // **必须 await**：协议探测 + 铸 cookie 完成后才能让上层调 API。
-            // 不 await 的实测后果＝「workspace.list HTTP 401」：flavor 仍是 legacy、
-            // 请求走一元 /api/workspace.list 且没带 cookie（2026-10-08）。
-            let det = await this.detectAndConnect();
-            if (!det) {
-                // 端口在监听但协议没应答：给一次短重试（服务/App 刚起来时常见）
-                await delay(1200);
-                det = await this.detectAndConnect();
-            }
-            if (!det) {
-                return {
-                    kind: "failed",
-                    message: `127.0.0.1:${this.activePort || this.settings.port} 端口在监听，但没拿到 DSH 协议响应（鉴权失败或版本不匹配）——点面板上的「诊断 DSH」看详情`,
-                };
+        // 先定实例（发现端口 + 探活），再谈"在不在线"——否则会在错误的端口上等满超时。
+        let picked = await this.resolveActiveInstance();
+        if (!picked.alive) {
+            if (picked.kind === "desktop") {
+                // 0.2.1+ 端口每次启动都变：打开 App 后**重新发现**，不能等固定端口。
+                if (!this.settings.openDesktopWhenMissing) {
+                    return { kind: "failed", message: this.serviceManager.describeOffline() };
+                }
+                const opened = await this.openDesktopApp();
+                if (!opened) return { kind: "failed", message: this.serviceManager.describeOffline() };
+                picked = await this.waitForDesktopInstance();
+                if (!picked) {
+                    return {
+                        kind: "failed",
+                        message: `已尝试打开桌面版 App，但 ${Math.ceil(Math.min(this.settings.readyTimeoutMs || 60000, 120000) / 1000)}s 内没有发现它的本地端口` +
+                            "（端口每次启动都会变；点面板上的「诊断 DSH」看发现结果）",
+                    };
+                }
+            } else {
+                // 旧版 dsh web：保留原自动启动链路（端口固定，可等）。
+                this.serviceManager.opts = this.getServiceOpts();
+                const r = await this.serviceManager.ensureOnline();
+                if (r.kind !== "online") return r;
+                picked = await this.resolveActiveInstance();
+                if (!picked.alive) return { kind: "failed", message: this.serviceManager.describeOffline() };
             }
         }
-        return r;
+        // **必须 await**：协议探测 + 铸 cookie 完成后才能让上层调 API。
+        // 不 await 的实测后果＝「workspace.list HTTP 401」：flavor 仍是 legacy、
+        // 请求走一元 /api/workspace.list 且没带 cookie（2026-10-08）。
+        let det = await this.detectAndConnect();
+        if (!det) {
+            // 端口在监听但协议没应答：给一次短重试（服务/App 刚起来时常见）
+            await delay(1200);
+            det = await this.detectAndConnect();
+        }
+        if (!det) {
+            return {
+                kind: "failed",
+                message: `127.0.0.1:${this.activePort} 端口在监听，但没拿到 DSH 协议响应（鉴权失败或版本不匹配）——点面板上的「诊断 DSH」看详情`,
+            };
+        }
+        return { kind: "online" };
     }
 
     getView() {
@@ -7519,15 +7693,20 @@ class DshNativePlugin extends Plugin {
     }
 
     async restartService() {
-        // **桌面版实例严禁 kill 端口**：19387 上跑的是用户正在用的 App（会话/插件的宿主），
-        // 杀掉它等于把桌面版整个关掉。这里只做"没起就帮忙打开 + 重连"。
+        // **桌面版实例严禁 kill 端口**：监听端口上跑的是用户正在用的 App（会话/插件的宿主），
+        // 杀掉它等于把桌面版整个关掉。这里只做"没起就帮忙打开 + 重新发现 + 重连"。
         if ((this.activeKind || "legacy") === "desktop") {
-            const port = this.activePort || DESKTOP_APP_PORT;
-            if (await tcpProbe(port, 800)) {
+            const port = this.activePort;
+            if (port && await tcpProbe(port, 800)) {
                 new Notice("当前连的是桌面版 App，它由 App 自己管理——插件不重启它，已重新连接");
             } else {
                 const opened = await this.openDesktopApp();
-                new Notice(opened ? "桌面版 App 没在运行，已尝试打开" : "桌面版 App 没在运行，且未找到安装位置");
+                const picked = opened ? await this.waitForDesktopInstance() : null;
+                if (picked) {
+                    new Notice("桌面版 App 已就绪（端口 " + picked.port + "），已重新连接");
+                } else {
+                    new Notice(opened ? "已尝试打开桌面版 App，但没发现它的本地端口" : "桌面版 App 没在运行，且未找到安装位置");
+                }
             }
             const view0 = this.getView();
             if (view0 && view0.boot) await view0.boot();
@@ -7559,7 +7738,7 @@ class DshNativePlugin extends Plugin {
         }
     }
     openDshInBrowser() {
-        // 打开**实际连接的**那个实例（桌面版 19387 / 旧版自定义端口），不是设置里的默认端口
+        // 打开**实际连接的**那个实例（桌面版自动发现端口 / 旧版自定义端口），不是设置里的默认端口
         this.openInBrowser(`http://127.0.0.1:${this.activePort || this.settings.port}/`);
     }
 

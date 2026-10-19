@@ -55,7 +55,13 @@ if (cookie) {
     const envelope = { type: "client-request", rpcId: "regress-1", method: "session/list", payload: { args: { _request: {} } } };
     const r = await post("session/list", envelope, cookie);
     let ok = r.status === 200;
-    try { const j = JSON.parse(r.text); ok = ok && j?.result?.ok === true; if (ok) firstSessionId = j.result.value?.items?.[0]?.sessionId ?? null; } catch { ok = false; }
+    try { const j = JSON.parse(r.text); ok = ok && j?.result?.ok === true; if (ok) {
+        const items = j.result.value?.items ?? [];
+        // 快照用例要「有历史」的会话：session/list 的第一条可能是新建的空会话（blank），
+        // 对空会话 session/follow 返回空快照是正确行为，会把回归假红掉（2026-10-19 实测）。
+        const withHistory = items.find((it) => !it.blank && it.cwd && it.origin !== "subagent") || items[0];
+        firstSessionId = withHistory?.sessionId ?? null;
+    } } catch { ok = false; }
     check("真机 session/list（铸 cookie 通过）", ok, `HTTP ${r.status}`);
 
     const bad = cookie.slice(0, -6) + "XXXXXX";

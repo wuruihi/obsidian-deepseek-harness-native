@@ -52,8 +52,38 @@ function locateDshRoot() {
 }
 
 // ---------- 从网关源码提取描述符（endpoint → args wire 名数组）----------
+// 0.2.1（hostProtocol 4）起描述符是「对象字面量」：`"session/list": { ... parameters: [{name,_wire?}] }`；
+// 0.2.0 及更早是 `id: "pkg#ep", parameters: [{name, wire}]`。两种都要认，否则会退化成
+// 「网关无此端点」的假红（2026-10-19 在 0.2.1 上实测踩中）。
 function parseDescriptors(gatewaySrc) {
     const desc = new Map();
+    // 新格式：缩进后跟 "ns/method": {
+    const entryRe = /^\s*"([A-Za-z0-9_$-]+\/[A-Za-z0-9_$\/-]+)"\s*:\s*\{/gm;
+    const keys = [];
+    let em;
+    while ((em = entryRe.exec(gatewaySrc))) keys.push({ ep: em[1], at: em.index });
+    for (let i = 0; i < keys.length; i++) {
+        const ep = keys[i].ep;
+        if (desc.has(ep)) continue;
+        const seg = gatewaySrc.slice(keys[i].at, i + 1 < keys.length ? keys[i + 1].at : gatewaySrc.length);
+        const ps = seg.indexOf("parameters:");
+        if (ps < 0) { desc.set(ep, []); continue; }
+        let pe = seg.indexOf("result:", ps);
+        if (pe < 0) pe = seg.indexOf("sourceLocation:", ps);
+        if (pe < 0) pe = seg.length;
+        const pseg = seg.slice(ps, pe);
+        const names = [];
+        for (const part of pseg.split(/name:\s*"/).slice(1)) {
+            const nm = part.slice(0, part.indexOf('"'));
+            if (!nm) continue;
+            const wireM = /wire:\s*"([^"]+)"/.exec(part);
+            names.push(wireM ? wireM[1] : nm); // 0.2.1 省略 wire 时默认取 name
+        }
+        desc.set(ep, names);
+    }
+    if (desc.size > 0) return desc;
+
+    // 旧格式（0.2.0 及更早）：id: "pkg#endpoint" + parameters:[{name,wire}]
     const idRe = /id:\s*"([^"]+)"/g;
     const marks = [];
     let m;
