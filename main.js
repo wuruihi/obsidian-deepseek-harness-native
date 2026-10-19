@@ -1824,6 +1824,15 @@ const INJECTED_HEADS = [
     /^Tool (?:policy|permissions)\b/,
     /^File policy\b/,
     /^Here (?:is|are) (?:your|the) (?:current |available )?(?:context|skills|tools|policy)/i,
+    // 0.2.1 运行上下文（source.kind 缺失/旧宿主时的兜底；权威判据仍是 source.kind != user）：
+    // 这是 2026-10-19 用户报「回复里带注入提示词」的原文形态
+    /^Current working directory:/,
+    /^You are (?:the )?[A-Za-z ]+ named\b/,
+    /^Current DeepSeek Harness implementation checkout:/,
+    /^Current DeepSeek Harness Web GUI URL:/,
+    /^Time sampled while preparing\b/,
+    /^Browser time zone for this request:/,
+    /^Elapsed since the preceding (?:model-visible )?message:/,
 ];
 
 function isSystemContextStart(s) {
@@ -2889,9 +2898,15 @@ function foldParseJson(raw) {
     try { return JSON.parse(raw); } catch (_e) { return undefined; }
 }
 
-/** user/message → (人类文本, 附件标签, 图片)。引用文件部件只留标签不留正文。 */
+/** user/message → (人类文本, 附件标签, 图片)。引用文件部件只留标签不留正文。
+ *  **source.kind 是权威判据（DSH 0.2.0+）**：只有 kind==="user" 才是用户真正发送的消息；
+ *  runtime-context / time-context / skill-catalog / agent-instructions / plugin:* /
+ *  model-selection / user-approval 都是宿主注入帧，必须整条丢弃（不能当消息气泡渲染）。
+ *  旧宿主没有 source.kind 时退回文本头启发式（INJECTED_HEADS + 段落剥离）。 */
 function foldExtractUserPayload(data) {
     const d = data || {};
+    const srcKind = typeof (d.source && d.source.kind) === "string" ? d.source.kind : "";
+    if (srcKind && srcKind !== "user") return { text: "", files: [], images: [] };
     const parts = [];
     const files = [];
     const images = [];
@@ -5946,12 +5961,15 @@ class DshNativeView extends ItemView {
         const fold = new DshFold();
         fold.pushMany(events || []);
         return fold.items.map((it) => (it.kind === "user"
-            ? { role: "user", text: it.text, files: it.files }
+            ? { role: "user", text: it.text, files: it.files, images: it.images }
             : { role: "assistant", turn: it }));
     }
 
     _renderHistoryItem(it, atTop) {
-        if (it.role === "user") this.addUserBubbleFromEvent({ data: { text: it.text, images: it.images } }, atTop);
+        // fromHistory=true：历史是权威源，**必须绕过「本地已发送」文本去重**。
+        // 否则同一会话里再次发送同样的文本（例如第二次「你好」）会被前一条历史同文消息
+        // 顶掉——2026-10-19 用户报「发完能看到、AI 回复后自己的消息消失」就是这个。
+        if (it.role === "user") this.addUserBubbleFromEvent({ data: { text: it.text, images: it.images } }, atTop, true);
         else this.renderStaticTurn(it.turn, atTop);
     }
 
@@ -6110,7 +6128,10 @@ class DshNativeView extends ItemView {
         finally { this._loadingOlder = false; }
     }
 
-    addUserBubbleFromEvent(ev, atTop = false) {
+    /** @param {boolean} fromHistory 历史回放（权威源）——跳过「本地已发送」文本去重：
+     *  同一会话里重复发送同一句话（例如两次「你好」）时，历史渲染必须两条都显示；
+     *  文本去重只服务于「send() 本地已渲染 + WS 回推同一条」这一种实时隔音场景。 */
+    addUserBubbleFromEvent(ev, atTop = false, fromHistory = false) {
         const d = ev.data || ev;
         let text = "";
         if (typeof d.text === "string") text = d.text;
@@ -6123,21 +6144,24 @@ class DshNativeView extends ItemView {
         // 剥注入（运行时快照/策略变更以 user/message 形式回推时必须 strip）
         const cleaned = stripSystemContext(text);
         if (!cleaned) return; // 整段都是注入就别渲染
-        // 去重：send() 已本地渲染过的、DSH 又回推的 user/message 不显示第二次
         const key = (cleaned.replace(/\s+/g, " ").trim());
-        if (!this._userTextsSent) this._userTextsSent = new Set();
-        if (this._userTextsSent.has(key)) return;
-        if (this._userTextsSent.size >= 64) this._userTextsSent.clear(); // 简单抗膨胀
-        this._userTextsSent.add(key);
+        if (!fromHistory) {
+            // 去重：send() 已本地渲染过的、DSH 又回推的 user/message 不显示第二次。
+            // **历史回放不得走这条**（否则重复发送的同一文本会被历史里的前一条顶掉）。
+            if (!this._userTextsSent) this._userTextsSent = new Set();
+            if (this._userTextsSent.has(key)) return;
+            if (this._userTextsSent.size >= 64) this._userTextsSent.clear(); // 简单抗膨胀
+            this._userTextsSent.add(key);
+        }
         // 收到一条不在历史里的新 user/message → 退出 WS catchup，后续 assistant 事件正常处理
-        if (this._wsCatchup) {
+        if (!fromHistory && this._wsCatchup) {
             console.log(`[DSH MSG] exit catchup due to new user/message key=${JSON.stringify(key.slice(0,50))}`);
             this._wsCatchup = false;
         }
         // 实时候推防重复（关键修复）：DSH 会在发送后以 user/message 回推同一条消息。
         // 仅当末尾是「活跃助手气泡」(this.assistantEl) 时跳过——此时本地用户消息已在其上方。
         // 历史首屏渲染末尾是静态助手气泡（非 assistantEl），不能跳过，否则交替 U/A 中 user 消息会丢失。
-        if (!atTop && this.messagesEl) {
+        if (!fromHistory && !atTop && this.messagesEl) {
             const last = this.messagesEl.lastElementChild;
             if (last) {
                 if (last === this.assistantEl) {

@@ -369,5 +369,61 @@ const check = (name, ok, detail = "") => {
     check("foldLatestTurn 多步 + 去重", !!t && t.text === "流一歩二".replace("歩", "步") && t.ended === true, JSON.stringify(t && t.text));
 }
 
+// 20. source.kind 权威过滤（2026-10-19 用户报「回复里带注入提示词」的根因）：
+//     一次发送 = 1 条 kind=user + N 条注入帧；只有 kind==="user" 才能变成用户气泡。
+{
+    const f = new DshFold();
+    let seq = 1;
+    const injection = (kind, text) => ({ event: { type: "user/message", seq: ++seq, data: { content: [{ type: "text", text }], source: { kind }, role: "user" } } });
+    f.pushMany([
+        { event: { type: "turn/start", seq: 1, data: {} } },
+        injection("user", "你好"),
+        injection("agent-instructions", "<system-reminder>\n# 全局指令\n……\n</system-reminder>"),
+        injection("runtime-context", 'Current working directory: "D:\\02-bywork".\n\nYou are the Team Lead named "lead".'),
+        injection("skill-catalog", "<available_skills>\n- foo\n</available_skills>"),
+        injection("time-context", "Time sampled while preparing turn 5, step 1: 2026-10-19T10:59:05+08:00[Asia/Shanghai]"),
+        injection("model-selection", "[model changed: a → b]"),
+        injection("user-approval", 'The approval policy changed from "ask" to "never".'),
+        { event: { type: "assistant/message", seq: 20, data: { turn: 1, step: 1, message: { role: "assistant", content: [{ type: "text", text: "回复" }] } } } },
+        { event: { type: "turn/end", seq: 21, data: {} } },
+    ]);
+    const users = f.items.filter((i) => i.kind === "user");
+    check("source.kind≠user 的注入帧不生成用户气泡（6 条注入只留 1 条真消息）", users.length === 1, `users=${users.length}`);
+    check("唯一用户气泡是用户真正发的文本", users.length === 1 && users[0].text === "你好", JSON.stringify(users[0] && users[0].text));
+}
+
+// 21. 旧宿主没有 source.kind：退回文本头启发式，且不能误伤真消息
+{
+    const f = new DshFold();
+    f.pushMany([
+        { event: { type: "turn/start", seq: 1, data: {} } },
+        { event: { type: "user/message", seq: 2, data: { content: [{ type: "text", text: "你好" }] } } },
+        { event: { type: "user/message", seq: 3, data: { content: [{ type: "text", text: 'Current working directory: "D:\\02-bywork".\n\nYou are the Team Lead named "lead".\nUse list_agents({}) …' }] } } },
+        { event: { type: "user/message", seq: 4, data: { content: [{ type: "text", text: "Time sampled while preparing turn 5, step 1: …" }] } } },
+        { event: { type: "user/message", seq: 5, data: { content: [{ type: "text", text: 'Current DeepSeek Harness implementation checkout: "C:\\\\x\\\\".' }] } } },
+    ]);
+    const users = f.items.filter((i) => i.kind === "user");
+    check("无 source.kind 时文本头注入也被剥掉（只留真消息）", users.length === 1 && users[0].text === "你好", JSON.stringify(users.map((u) => u.text)));
+}
+
+// 22. 同一会话重复发送同一文本：fold 必须保留两条（历史渲染按条数/seq，不按文本去重）
+{
+    const f = new DshFold();
+    f.pushMany([
+        { event: { type: "turn/start", seq: 1, data: {} } },
+        { event: { type: "user/message", seq: 2, data: { content: [{ type: "text", text: "你好" }], source: { kind: "user" } } } },
+        { event: { type: "assistant/message", seq: 3, data: { turn: 1, step: 1, message: { role: "assistant", content: [{ type: "text", text: "第一次回复" }] } } } },
+        { event: { type: "turn/end", seq: 4, data: {} } },
+        { event: { type: "turn/start", seq: 5, data: {} } },
+        { event: { type: "user/message", seq: 6, data: { content: [{ type: "text", text: "你好" }], source: { kind: "user" } } } },
+        { event: { type: "assistant/message", seq: 7, data: { turn: 2, step: 1, message: { role: "assistant", content: [{ type: "text", text: "第二次回复" }] } } } },
+        { event: { type: "turn/end", seq: 8, data: {} } },
+    ]);
+    const users = f.items.filter((i) => i.kind === "user");
+    check("重复发送同一文本保留两条用户消息（历史渲染不得按文本去重）", users.length === 2 && users.every((u) => u.text === "你好"), `users=${users.length}`);
+    const kinds = f.items.map((i) => i.kind).join(",");
+    check("用户消息都排在自己那轮助手回复之前（U,A,U,A）", kinds === "user,turn,user,turn", kinds);
+}
+
 console.log(`\n${pass}/${pass + fail} passed`);
 process.exit(fail ? 1 : 0);
